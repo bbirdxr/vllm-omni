@@ -1,0 +1,37 @@
+# Reference deployment knobs for Qwen/Qwen3-ForcedAligner-0.6B running
+# alongside a TTS pipeline (issue #3631).
+#
+# These values are NOT consumed automatically — they document the
+# defaults baked into vllm_omni.utils.forced_aligner.ForcedAlignerConfig
+# and give operators a starting point if they need to override them.
+# To override, edit ForcedAlignerConfig defaults or wire a richer CLI
+# in a follow-up PR.
+#
+# vLLM runs the aligner as:
+#     LLM(
+#         model="Qwen/Qwen3-ForcedAligner-0.6B",
+#         runner="pooling",
+#         hf_overrides={
+#             "architectures": ["Qwen3ASRForcedAlignerForTokenClassification"]
+#         },
+#         ...
+#     )
+# and requests use pooling_task="token_classify".
+
+forced_aligner:
+  # GPU memory cap for the aligner LLM. The aligner runs in the API
+  # server process, so this carves into the same GPU as the TTS
+  # workers. Set conservatively for the smallest deployment target
+  # (24 GB consumer cards); raise on H100-class boxes.
+  gpu_memory_utilization: 0.25
+
+  # FP16 for compute, BF16 also fine on Hopper. The classifier head
+  # uses model dtype (not head_dtype) so this choice flows through.
+  dtype: bfloat16
+
+  # Aligner sees one prompt at a time (one request -> one chunk -> one
+  # forward) so a tight max_model_len is enough.
+  max_model_len: 4096
+
+  # Required for tokenizers shipped with code in the repo.
+  trust_remote_code: true

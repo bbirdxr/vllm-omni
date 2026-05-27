@@ -160,6 +160,21 @@ class OmniEngineArgs(EngineArgs):
             )
         except argparse.ArgumentError:
             pass
+        # Forced aligner / word timestamps (issue #3631). Single flag;
+        # passing a model path enables the feature, omitting disables.
+        try:
+            parser.add_argument(
+                "--forced-aligner",
+                type=str,
+                default=None,
+                help=(
+                    "Enable streaming TTS word timestamps via a forced aligner. "
+                    "Pass the aligner model path/name, e.g. "
+                    "'Qwen/Qwen3-ForcedAligner-0.6B'. Disabled when omitted."
+                ),
+            )
+        except argparse.ArgumentError:
+            pass
         return parser
 
     omni_master_address: str | None = None
@@ -173,6 +188,13 @@ class OmniEngineArgs(EngineArgs):
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
+
+    # Forced aligner / word timestamps (issue #3631). Single flag —
+    # passing a model path enables the feature, omitting disables.
+    # Heavy knobs (gpu_memory_utilization, dtype, max_model_len) live
+    # on ForcedAlignerConfig defaults; override via deploy yaml when
+    # needed instead of cluttering the CLI.
+    forced_aligner: str | None = None
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:
