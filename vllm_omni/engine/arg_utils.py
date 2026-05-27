@@ -160,6 +160,50 @@ class OmniEngineArgs(EngineArgs):
             )
         except argparse.ArgumentError:
             pass
+        # Forced aligner / word timestamps (issue #3631). Default-off; when
+        # enabled, --aligner-gpu-memory is required (no safe default).
+        try:
+            parser.add_argument(
+                "--enable-word-timestamps",
+                action="store_true",
+                default=False,
+                help=(
+                    "Run a shared forced aligner alongside TTS streaming and emit "
+                    "word-level timestamps per audio chunk. Requires --aligner-gpu-memory."
+                ),
+            )
+        except argparse.ArgumentError:
+            pass
+        try:
+            parser.add_argument(
+                "--aligner-model",
+                type=str,
+                default="Qwen/Qwen3-ForcedAligner-0.6B",
+                help="HuggingFace model id or local path of the forced aligner.",
+            )
+        except argparse.ArgumentError:
+            pass
+        try:
+            parser.add_argument(
+                "--aligner-gpu-memory",
+                type=float,
+                default=None,
+                help=(
+                    "Fraction of aligner GPU memory to reserve, in (0.0, 1.0). "
+                    "No default; required when --enable-word-timestamps is set."
+                ),
+            )
+        except argparse.ArgumentError:
+            pass
+        try:
+            parser.add_argument(
+                "--aligner-device",
+                type=str,
+                default="cuda:0",
+                help="Device for the aligner subprocess, e.g. 'cuda:0', 'cuda:1', 'cpu'.",
+            )
+        except argparse.ArgumentError:
+            pass
         return parser
 
     omni_master_address: str | None = None
@@ -174,14 +218,56 @@ class OmniEngineArgs(EngineArgs):
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
 
+    # --- Forced aligner (issue #3631) ---
+    # Opt-in word-level timestamps for streaming TTS. Implementation lives
+    # in ``vllm_omni.aligner``; default-off so existing deployments are
+    # untouched. ``aligner_gpu_memory`` has no default because heterogeneous
+    # GPU setups cannot share one (mirrors vLLM upstream's
+    # ``--gpu-memory-utilization`` style).
+    enable_word_timestamps: bool = False
+    aligner_model: str = "Qwen/Qwen3-ForcedAligner-0.6B"
+    aligner_gpu_memory: float | None = None
+    aligner_device: str = "cuda:0"
+
     def __post_init__(self) -> None:
         if self.worker_cls is None:
             if self.worker_type == "ar":
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
             elif self.worker_type == "generation":
                 self.worker_cls = current_omni_platform.get_omni_generation_worker_cls()
+        self._validate_aligner_args()
         load_omni_general_plugins()
         super().__post_init__()
+
+    def _validate_aligner_args(self) -> None:
+        """Enforce that ``--enable-word-timestamps`` ships with explicit GPU sizing.
+
+        We deliberately refuse to pick a default for ``aligner_gpu_memory``
+        because the right value depends on the TTS pipeline already loaded
+        on the same device (Qwen3-TTS leaves much less headroom than e.g.
+        MOSS-TTS-Nano) and on the GPU model. Failing fast with a
+        recommendation table is friendlier than booting and OOM-ing under
+        the first real request.
+        """
+        if not self.enable_word_timestamps:
+            return
+        if self.aligner_gpu_memory is None:
+            raise ValueError(
+                "--enable-word-timestamps requires --aligner-gpu-memory to be set "
+                "(no default; heterogeneous GPU setups have no safe choice).\n"
+                "Recommended starting points for Qwen/Qwen3-ForcedAligner-0.6B (FP16):\n"
+                "  H100 80GB:   0.05 - 0.08\n"
+                "  A100 80GB:   0.05 - 0.10\n"
+                "  A100 40GB:   0.10 - 0.15\n"
+                "  RTX 4090 24G: 0.15 - 0.20\n"
+                "Pick the lowest value that fits without OOM under expected concurrency."
+            )
+        if not 0.0 < self.aligner_gpu_memory < 1.0:
+            raise ValueError(f"--aligner-gpu-memory must be in (0.0, 1.0); got {self.aligner_gpu_memory}")
+        if not self.aligner_device.startswith(("cuda:", "cpu", "npu:", "xpu:")):
+            raise ValueError(
+                f"--aligner-device must look like 'cuda:N', 'npu:N', 'xpu:N', or 'cpu'; got {self.aligner_device!r}"
+            )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "OmniEngineArgs":

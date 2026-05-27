@@ -454,6 +454,13 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         state = getattr(app, "state", None)
         serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
         if serving_speech is not None:
+            # Drain the forced-aligner sidecar before tearing down the
+            # speech service so any pending alignments are abandoned
+            # cleanly. No-op when --enable-word-timestamps is off.
+            try:
+                await serving_speech.shutdown_aligner()
+            except Exception:  # noqa: BLE001
+                logger.exception("Aligner shutdown raised during server teardown.")
             serving_speech.shutdown()
         sock.close()
 
@@ -915,6 +922,18 @@ async def omni_init_app_state(
     state.openai_serving_speech = OmniOpenAIServingSpeech(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
+
+    # Forced aligner / word timestamps (issue #3631). Default-off; when
+    # the operator passes --enable-word-timestamps, we spin up the
+    # aligner sidecar before serving the first real request. Failure
+    # here intentionally bubbles up so the API server refuses to start
+    # rather than booting in a half-broken state.
+    if getattr(args, "enable_word_timestamps", False):
+        from vllm_omni.aligner.sidecar_client import build_client_from_engine_args
+
+        aligner_client = build_client_from_engine_args(args)
+        state.openai_serving_speech.attach_aligner_client(aligner_client)
+        await state.openai_serving_speech.start_aligner_dispatcher()
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
     # real user request is fast instead of paying a 100s compilation tax.

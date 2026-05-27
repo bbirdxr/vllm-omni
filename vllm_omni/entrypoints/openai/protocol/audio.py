@@ -7,6 +7,32 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator, model_vali
 _MAX_EMBEDDING_DIM = 8192
 
 
+class WordTimestamp(BaseModel):
+    """One aligned word emitted alongside a streaming TTS audio chunk.
+
+    Time offsets are millisecond-resolution from the start of the parent
+    sentence (not from the start of the session). For CJK languages the
+    server defaults to character granularity; clients that want word-level
+    grouping should join consecutive entries themselves.
+    """
+
+    word: str = Field(description="Aligned token (word for spaced languages, character for CJK).")
+    start_ms: int = Field(ge=0, description="Start offset within the sentence, milliseconds.")
+    end_ms: int = Field(ge=0, description="End offset within the sentence, milliseconds (>= start_ms).")
+    confidence: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Optional alignment confidence in [0, 1]. None when the aligner does not score.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "WordTimestamp":
+        if self.end_ms < self.start_ms:
+            raise ValueError(f"end_ms ({self.end_ms}) must be >= start_ms ({self.start_ms})")
+        return self
+
+
 class OpenAICreateSpeechRequest(BaseModel):
     input: str
     model: str | None = None
@@ -84,6 +110,14 @@ class OpenAICreateSpeechRequest(BaseModel):
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
+    )
+    word_timestamps: bool = Field(
+        default=False,
+        description=(
+            "When true, the server runs a shared forced aligner alongside generation and "
+            "emits per-chunk word timestamps. Requires the server to be launched with "
+            "--enable-word-timestamps. No effect on the response when streaming is off."
+        ),
     )
 
     @field_validator("stream_format")
@@ -280,6 +314,15 @@ class StreamingSpeechSessionConfig(BaseModel):
         description=(
             "Text splitting granularity: 'sentence' splits on .!?。！？, "
             "'clause' also splits on CJK commas ， and semicolons ；."
+        ),
+    )
+    word_timestamps: bool = Field(
+        default=False,
+        description=(
+            "When true, audio chunks are wrapped in JSON 'audio.chunk' frames carrying "
+            "base64-encoded PCM plus aligned word timestamps. Requires the server to be "
+            "launched with --enable-word-timestamps. When false, audio is sent as raw "
+            "binary frames (existing behavior)."
         ),
     )
 

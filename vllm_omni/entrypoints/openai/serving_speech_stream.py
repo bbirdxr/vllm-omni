@@ -9,15 +9,33 @@ Protocol:
         {"type": "input.text", "text": "..."} # Text chunks
         {"type": "input.done"}            # End of input
 
-    Server -> Client:
+    Server -> Client (default, word_timestamps=false):
         {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "wav"}
         <binary frame: audio bytes>
+        ...
         {"type": "audio.done", "sentence_index": 0}
         {"type": "session.done", "total_sentences": N}
         {"type": "error", "message": "..."}
+
+    Server -> Client (when word_timestamps=true, issue #3631):
+        {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm"}
+        {"type": "audio.chunk", "sentence_index": 0, "chunk_id": 0,
+         "audio_b64": "<base64 PCM>",
+         "timestamps": [{"word": "...", "start_ms": ..., "end_ms": ..., "confidence": ...}, ...] | null}
+        ...
+        {"type": "audio.done", "sentence_index": 0}
+        ...
+
+    Notes on the timestamps field semantics:
+      - ``timestamps: []``   -> aligner ran successfully but produced no
+                                tokens (silence / pause chunk).
+      - ``timestamps: null`` -> aligner failed for this chunk (timeout,
+                                decode error, sidecar crash). Audio is
+                                always sent regardless.
 """
 
 import asyncio
+import base64
 import json
 from contextlib import aclosing
 
@@ -25,6 +43,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from vllm.logger import init_logger
 
+from vllm_omni.aligner import AlignerError
 from vllm_omni.entrypoints.openai.protocol.audio import (
     OpenAICreateSpeechRequest,
     StreamingSpeechSessionConfig,
@@ -43,6 +62,10 @@ _DEFAULT_CONFIG_TIMEOUT = 10.0  # seconds
 _PCM_SAMPLE_RATE = 24000
 _MAX_CONFIG_MESSAGE_SIZE = 4 * 1024 * 1024  # allow large ref_audio payloads
 _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
+# Per-chunk alignment wait. Long enough that a 0.6B aligner forward on a
+# busy GPU still completes; short enough that a stuck sidecar does not
+# hold up audio. Failures map to ``timestamps: null``.
+_ALIGNER_CHUNK_TIMEOUT_S = 2.0
 
 
 class OmniStreamingSpeechHandler:
@@ -210,6 +233,27 @@ class OmniStreamingSpeechHandler:
         """Generate audio for a single sentence and send it over WebSocket."""
         response_format = config.response_format or "wav"
 
+        # Word-timestamps preconditions (issue #3631). Reject early so the
+        # client gets a clear server-side reason instead of a silent
+        # failure or weird mode interaction. Default-off requests skip
+        # this entirely.
+        if config.word_timestamps:
+            if self._speech_service.aligner_client is None:
+                await self._send_error(
+                    websocket,
+                    "word_timestamps=true but the server was launched without "
+                    "--enable-word-timestamps; either restart the server with "
+                    "that flag or set word_timestamps=false in session.config.",
+                )
+                return
+            if not (config.stream_audio and response_format == "pcm"):
+                await self._send_error(
+                    websocket,
+                    "word_timestamps=true requires stream_audio=true and "
+                    "response_format='pcm' (the aligner consumes raw PCM).",
+                )
+                return
+
         request = OpenAICreateSpeechRequest(
             input=sentence_text,
             model=config.model,
@@ -226,6 +270,7 @@ class OmniStreamingSpeechHandler:
             x_vector_only_mode=config.x_vector_only_mode,
             speaker_embedding=config.speaker_embedding,
             stream=config.stream_audio,
+            word_timestamps=config.word_timestamps,
         )
 
         start_payload = {
@@ -236,6 +281,10 @@ class OmniStreamingSpeechHandler:
         }
         if config.stream_audio and response_format == "pcm":
             start_payload["sample_rate"] = _PCM_SAMPLE_RATE
+        if config.word_timestamps:
+            # Surface the active timestamp mode in audio.start so the
+            # client can switch frame parsers up front.
+            start_payload["word_timestamps"] = True
         await websocket.send_json(start_payload)
 
         total_bytes = 0
@@ -244,10 +293,19 @@ class OmniStreamingSpeechHandler:
         try:
             if config.stream_audio:
                 request_id, generator, _ = await self._speech_service._prepare_speech_generation(request)
-                async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
-                    async for chunk in stream:
-                        total_bytes += len(chunk)
-                        await websocket.send_bytes(chunk)
+                if config.word_timestamps:
+                    total_bytes = await self._stream_audio_with_alignments(
+                        websocket=websocket,
+                        request_id=request_id,
+                        generator=generator,
+                        sentence_text=sentence_text,
+                        sentence_index=sentence_index,
+                    )
+                else:
+                    async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
+                        async for chunk in stream:
+                            total_bytes += len(chunk)
+                            await websocket.send_bytes(chunk)
             else:
                 audio_bytes, _ = await self._speech_service._generate_audio_bytes(request)
                 total_bytes = len(audio_bytes)
@@ -258,10 +316,15 @@ class OmniStreamingSpeechHandler:
                     await self._speech_service.engine_client.abort(request_id)
                 except Exception:
                     logger.debug("Failed to abort streaming speech request %s", request_id, exc_info=True)
+                # Drop any pending aligner futures for this request so
+                # the dispatcher does not hold them.
+                self._cancel_aligner(request_id)
             raise
         except Exception as e:
             generation_failed = True
             logger.error("Generation failed for sentence %d: %s", sentence_index, e)
+            if request_id is not None:
+                self._cancel_aligner(request_id)
             await self._send_error(websocket, f"Generation failed for sentence {sentence_index}: {e}")
         finally:
             try:
@@ -275,6 +338,104 @@ class OmniStreamingSpeechHandler:
                 )
             except Exception:
                 logger.debug("Failed to send audio.done for sentence %d", sentence_index, exc_info=True)
+
+    async def _stream_audio_with_alignments(
+        self,
+        *,
+        websocket: WebSocket,
+        request_id: str,
+        generator,
+        sentence_text: str,
+        sentence_index: int,
+    ) -> int:
+        """Stream PCM as JSON ``audio.chunk`` frames carrying alignment.
+
+        Per-chunk flow: enqueue the (audio, text) pair on the aligner,
+        await its result with a short timeout, then send a single JSON
+        frame containing both base64 PCM and the timestamps list.
+
+        Failure handling preserves the contract that audio always flows:
+
+        * ``AlignerError`` on submit (sidecar dead, queue full): the rest
+          of *this* request is degraded to ``timestamps: null``; future
+          requests retry from scratch.
+        * Timeout / per-chunk decode failure: this chunk gets
+          ``timestamps: null``; subsequent chunks keep trying.
+
+        Returns the total number of audio bytes sent (matches the
+        non-timestamps branch's accounting).
+        """
+        aligner = self._speech_service.aligner_client
+        assert aligner is not None  # guarded by the precondition check in _generate_and_send
+
+        chunk_id = 0
+        total_bytes = 0
+        aligner_disabled_for_request = False
+
+        async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
+            async for chunk in stream:
+                total_bytes += len(chunk)
+                timestamps: list[dict] | None
+
+                if aligner_disabled_for_request:
+                    timestamps = None
+                else:
+                    try:
+                        aligner.submit(
+                            request_id,
+                            sentence_index,
+                            chunk_id,
+                            audio=chunk,
+                            text=sentence_text,
+                            sample_rate=_PCM_SAMPLE_RATE,
+                        )
+                    except AlignerError as exc:
+                        logger.warning(
+                            "Aligner submit failed (kind=%s) for req=%s; falling back to "
+                            "null timestamps for the remainder of this request.",
+                            exc.kind.value,
+                            request_id,
+                        )
+                        aligner_disabled_for_request = True
+                        timestamps = None
+                    else:
+                        try:
+                            timestamps = await asyncio.wait_for(
+                                aligner.aligned(request_id, sentence_index, chunk_id),
+                                timeout=_ALIGNER_CHUNK_TIMEOUT_S,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.debug("Aligner timed out on req=%s chunk=%d", request_id, chunk_id)
+                            timestamps = None
+                        except AlignerError:
+                            timestamps = None
+
+                await websocket.send_json(
+                    {
+                        "type": "audio.chunk",
+                        "sentence_index": sentence_index,
+                        "chunk_id": chunk_id,
+                        "audio_b64": base64.b64encode(chunk).decode("ascii"),
+                        "timestamps": timestamps,
+                    }
+                )
+                chunk_id += 1
+
+        return total_bytes
+
+    def _cancel_aligner(self, request_id: str) -> None:
+        """Best-effort cancellation of pending aligner futures for a request."""
+        aligner = self._speech_service.aligner_client
+        if aligner is None:
+            return
+        try:
+            aligner.cancel(request_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "Failed to cancel aligner pending for %s",
+                request_id,
+                exc_info=True,
+            )
 
     @staticmethod
     async def _send_error(websocket: WebSocket, message: str) -> None:

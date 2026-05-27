@@ -319,6 +319,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         super().__init__(*args, **kwargs)
         self._init_speaker_storage()
 
+        # Forced aligner (issue #3631). Populated by the API server after
+        # construction iff ``--enable-word-timestamps`` is set; otherwise
+        # stays ``None`` and the streaming handler keeps emitting raw
+        # binary PCM frames as before.
+        self.aligner_client: Any | None = None
+
         # Find and cache the TTS stage (if any) during initialization
         self._tts_stage = self._find_tts_stage()
         self._is_tts = self._tts_stage is not None
@@ -365,6 +371,43 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._build_voxtral_prompt_async = make_async(self._build_voxtral_prompt, executor=self._tts_executor)
         self._build_fish_speech_prompt_async = make_async(self._build_fish_speech_prompt, executor=self._tts_executor)
         self._estimate_prompt_len_async = make_async(self._estimate_prompt_len, executor=self._tts_executor)
+
+    def attach_aligner_client(self, client: Any) -> None:
+        """Wire up a forced-aligner client built by the API server bootstrap.
+
+        Called once after construction when ``--enable-word-timestamps``
+        is set. The client owns the sidecar subprocess; this object only
+        forwards calls to it from the streaming handler. ``None`` (no
+        attach) leaves the streaming path emitting raw binary frames.
+        """
+        if self.aligner_client is not None:
+            logger.warning("Replacing existing aligner client; previous one will not be shut down.")
+        self.aligner_client = client
+
+    async def start_aligner_dispatcher(self) -> None:
+        """Start the aligner client's asyncio multiplexer task.
+
+        Must be invoked from inside the API server's running event loop
+        (after FastAPI lifespan startup). No-op when no aligner is
+        attached. Failures during start propagate up so the API server
+        refuses to come up — same fail-fast semantics as the
+        ``--aligner-gpu-memory`` validator in ``OmniEngineArgs``.
+        """
+        if self.aligner_client is None:
+            return
+        await self.aligner_client.start_dispatcher()
+        logger.info("Aligner dispatcher started; word_timestamps requests are now served.")
+
+    async def shutdown_aligner(self, timeout: float = 5.0) -> None:
+        """Drain pending alignments and stop the sidecar subprocess."""
+        if self.aligner_client is None:
+            return
+        try:
+            await self.aligner_client.shutdown(timeout=timeout)
+        except Exception:  # noqa: BLE001
+            logger.exception("Aligner shutdown raised; continuing API server shutdown.")
+        finally:
+            self.aligner_client = None
 
     async def warmup(self) -> None:
         """Run a synthetic speech request to trigger all first-request warmup.
