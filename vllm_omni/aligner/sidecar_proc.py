@@ -2,22 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Aligner sidecar subprocess entry point.
 
-Owns the forced-aligner model in its own Python process so it cannot
-interfere with the API server's event loop or the vLLM workers' GPU
-memory accounting. PR-2 replaces this entry with a native stage worker
-without changing the queue contract.
+Owns a standalone ``vllm.LLM`` instance running the upstream
+:class:`vllm.model_executor.models.qwen3_asr_forced_aligner.\
+Qwen3ASRForcedAlignerForTokenClassification` model. The instance lives
+in its own Python process so its CUDA context, GPU memory, and pooling
+runner do not interfere with the TTS workers' generation engine.
+
+PR-2 replaces this entry with a native ``LLM_GENERATION``-style stage
+worker (or a new ``StageExecutionType.POOLING`` if the maintainers
+prefer); either way the queue contract on top of it stays unchanged.
 
 Lifecycle:
 
 1. Parent constructs ``in_q``, ``out_q``, ``ready_q`` (multiprocessing
    queues) and spawns this function via ``mp.Process``.
 2. Child sets ``CUDA_VISIBLE_DEVICES`` from ``args.aligner_device`` so
-   the GPU index lookup matches the parent's view.
-3. Child loads the aligner model + processor lazily, calls
-   ``torch.cuda.set_per_process_memory_fraction(args.aligner_gpu_memory)``
-   to keep its slice off the vLLM workers' books, then puts a single
-   ``"READY"`` token onto ``ready_q``.
-4. Busy loop: ``in_q.get()`` -> forward -> ``out_q.put(AlignmentResponse)``.
+   the visible-index inside the child is always 0.
+3. Child constructs a ``vllm.LLM`` with ``runner="pooling"`` and the
+   ``Qwen3ASRForcedAlignerForTokenClassification`` architecture
+   override, then puts a single ``"READY"`` token onto ``ready_q``.
+4. Busy loop: ``in_q.get()`` -> ``llm.encode`` ->
+   ``decode_alignment_outputs`` -> ``out_q.put(AlignmentResponse)``.
 5. ``SHUTDOWN_SIGNAL`` on ``in_q`` (or process signal) breaks the loop.
 
 If anything in steps 2-3 fails, the child puts the exception text onto
@@ -147,95 +152,144 @@ def _busy_loop(runtime: _AlignerRuntime, in_q: MPQueue, out_q: MPQueue) -> None:
 
 
 class _AlignerRuntime:
-    """Holds the loaded aligner model + processor inside the subprocess.
+    """Holds a standalone ``vllm.LLM`` instance inside the subprocess.
 
-    The actual ``align()`` implementation is intentionally a thin shim
-    around :mod:`vllm_omni.aligner.ctc_decode` so the model-loading
-    plumbing stays separate from the alignment math (and so the math
-    can be unit-tested without spawning a process).
+    Implementation is deliberately thin: the upstream
+    :class:`Qwen3ASRForcedAlignerForTokenClassification` model already
+    ships with the multimodal processor, classifier head, and
+    ``token_classify`` pooler. This class is just the sidecar-side
+    adapter for the queue contract.
     """
 
-    def __init__(self, model: object, processor: object, frame_hop_ms: float):
-        self._model = model
-        self._processor = processor
-        self._frame_hop_ms = frame_hop_ms
+    # Pulled out as class constants so tests can override them and so
+    # the values are visible at the top of the file (vs buried inside
+    # the LLM(...) call).
+    _POOLING_TASK = "token_classify"
+    _ARCHITECTURE = "Qwen3ASRForcedAlignerForTokenClassification"
+
+    def __init__(
+        self,
+        llm: object,
+        timestamp_token_id: int,
+        classify_num: int,
+    ) -> None:
+        self._llm = llm
+        self._timestamp_token_id = timestamp_token_id
+        self._classify_num = classify_num
 
     @classmethod
     def startup(cls, args: SidecarArgs) -> _AlignerRuntime:
-        # Restrict CUDA visibility before importing torch so the device
-        # index the rest of the sidecar uses (always cuda:0 internally)
-        # maps to the user-requested physical GPU.
+        # Restrict CUDA visibility before importing vllm so the
+        # in-process device index (always 0 from here on) maps to the
+        # user-requested physical GPU.
         if args.aligner_device.startswith("cuda:"):
             os.environ["CUDA_VISIBLE_DEVICES"] = args.aligner_device.split(":", 1)[1]
 
-        # Lazy imports: torch / transformers must not enter the parent
-        # process even when --enable-word-timestamps is off.
-        import torch
-        from transformers import AutoModelForCTC, AutoProcessor
+        # Lazy import: vllm must not enter the parent process even when
+        # --enable-word-timestamps is off, otherwise we double-import
+        # CUDA contexts.
+        from vllm import LLM
 
-        if torch.cuda.is_available() and args.aligner_device.startswith("cuda:"):
-            torch.cuda.set_per_process_memory_fraction(args.aligner_gpu_memory, device=0)
-
-        logger.info("Loading aligner model %s on %s", args.aligner_model, args.aligner_device)
-        processor = AutoProcessor.from_pretrained(args.aligner_model)
-        model = AutoModelForCTC.from_pretrained(
+        logger.info(
+            "Loading aligner %s via vllm pooling runner on %s",
             args.aligner_model,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            args.aligner_device,
         )
-        if args.aligner_device.startswith("cuda"):
-            model = model.cuda()
-        elif args.aligner_device.startswith(("npu:", "xpu:")):
-            # Best-effort device move; .to() raises a clear error if the
-            # backend isn't installed in this environment.
-            model = model.to(args.aligner_device)
-        model.eval()
+        llm = LLM(
+            model=args.aligner_model,
+            runner="pooling",
+            hf_overrides={"architectures": [cls._ARCHITECTURE]},
+            gpu_memory_utilization=args.aligner_gpu_memory,
+            trust_remote_code=True,
+            enforce_eager=False,
+        )
 
-        # Frame-rate / hop is needed to convert CTC frame indices to ms.
-        # Different aligners expose this differently; ctc_decode resolves
-        # it from the model config.
-        from vllm_omni.aligner.ctc_decode import resolve_frame_hop_ms
+        # Resolve the two model-derived constants the decoder needs:
+        #   * timestamp special-token id (locates marker rows in the
+        #     [n_token, classify_num] logits tensor returned by the
+        #     pooler)
+        #   * classify_num (number of time bins per timestamp slot)
+        from vllm_omni.aligner.qwen3_aligner import resolve_timestamp_token_id
 
-        frame_hop_ms = resolve_frame_hop_ms(model.config)
-        return cls(model=model, processor=processor, frame_hop_ms=frame_hop_ms)
+        tokenizer = llm.get_tokenizer()
+        timestamp_token_id = resolve_timestamp_token_id(tokenizer)
+
+        thinker_config = getattr(llm.llm_engine.model_config.hf_config, "thinker_config", None)
+        if thinker_config is None or not hasattr(thinker_config, "classify_num"):
+            raise RuntimeError(
+                "Loaded aligner model has no thinker_config.classify_num; "
+                "expected a Qwen3ASRForcedAlignerForTokenClassification checkpoint."
+            )
+        classify_num = int(thinker_config.classify_num)
+
+        logger.info(
+            "Aligner ready: timestamp_token_id=%d, classify_num=%d",
+            timestamp_token_id,
+            classify_num,
+        )
+        return cls(llm=llm, timestamp_token_id=timestamp_token_id, classify_num=classify_num)
 
     def align(self, audio: bytes, text: str, sample_rate: int) -> list[dict]:
-        """Forward pass + CTC decode for one chunk.
+        """Run one forced-alignment pass; return word-timestamp dicts.
 
-        Returns a list of dicts with keys ``word``, ``start_ms``,
-        ``end_ms``, ``confidence``. Empty list is a valid result
-        (silence / no aligned tokens).
+        The empty list is a valid result (no aligned tokens — e.g. a
+        silence chunk). Failures raise; the caller turns those into
+        ``AlignmentResponse(ok=False, ...)`` so the streaming layer
+        emits ``timestamps: null``.
         """
-        # Lazy imports keep the sidecar's startup deterministic even when
-        # this method is patched out in tests.
-        import torch
+        from vllm.pooling_params import PoolingParams
 
-        from vllm_omni.aligner.ctc_decode import (
-            decode_ctc_alignment,
+        from vllm_omni.aligner.qwen3_aligner import (
+            build_aligner_prompt,
+            decode_alignment_outputs,
+            find_timestamp_positions,
             pcm_bytes_to_float_array,
         )
 
-        audio_array = pcm_bytes_to_float_array(audio, sample_rate=sample_rate)
-        with torch.inference_mode():
-            inputs = self._processor(
-                audio=audio_array,
-                sampling_rate=sample_rate,
-                return_tensors="pt",
-            )
-            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
-            logits = self._model(**inputs).logits  # [1, T, vocab_size]
+        audio_array = pcm_bytes_to_float_array(audio)
+        if audio_array.size == 0:
+            return []
+        audio_duration_ms = (audio_array.size / sample_rate) * 1000.0
 
-        return decode_ctc_alignment(
-            logits=logits[0].float().cpu(),
+        prompt = build_aligner_prompt(text, sample_rate=sample_rate)
+        request = {
+            "prompt": prompt,
+            "multi_modal_data": {"audio": (audio_array, sample_rate)},
+        }
+        outputs = self._llm.encode(  # type: ignore[union-attr]
+            [request],
+            pooling_params=PoolingParams(),
+            pooling_task=self._POOLING_TASK,
+            use_tqdm=False,
+        )
+        if not outputs:
+            return []
+
+        result = outputs[0]
+        # PoolingRequestOutput.outputs.data is [n_token, classify_num].
+        logits = result.outputs.data
+        prompt_token_ids = list(result.prompt_token_ids)
+        timestamp_positions = find_timestamp_positions(prompt_token_ids, self._timestamp_token_id)
+        if not timestamp_positions:
+            logger.warning(
+                "No <|timestamp|> tokens found in prompt for text=%r; aligner returned %d rows.",
+                text,
+                logits.shape[0],
+            )
+            return []
+
+        return decode_alignment_outputs(
+            logits=logits,
             text=text,
-            processor=self._processor,
-            frame_hop_ms=self._frame_hop_ms,
+            timestamp_positions=timestamp_positions,
+            classify_num=self._classify_num,
+            audio_duration_ms=audio_duration_ms,
         )
 
     def shutdown(self) -> None:
-        """Best-effort cleanup. No-op for plain transformers models."""
-        # Hold onto the model reference so any in-flight CUDA frees can
-        # finish; the OS will reclaim the rest at process exit.
-        self._model = None
-        self._processor = None
+        """Best-effort cleanup; the OS reclaims CUDA at process exit."""
+        # Drop the LLM ref so __del__ can run before the process exits;
+        # any in-flight CUDA frees finish on the way out.
+        self._llm = None
         sys.stdout.flush()
         sys.stderr.flush()
