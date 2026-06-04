@@ -299,6 +299,7 @@ class OmniStreamingSpeechHandler:
                         generator=generator,
                         sentence_text=sentence_text,
                         sentence_index=sentence_index,
+                        language=config.language,
                     )
                 else:
                     async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
@@ -341,6 +342,7 @@ class OmniStreamingSpeechHandler:
         generator,
         sentence_text: str,
         sentence_index: int,
+        language: str | None = None,
     ) -> int:
         """Stream PCM as JSON ``audio.chunk`` frames, aligned per sentence.
 
@@ -413,6 +415,7 @@ class OmniStreamingSpeechHandler:
             text=sentence_text,
             sample_rate=sample_rate,
             config=aligner_config,
+            language=language,
         )
         sentence_end_ms = int(round((len(sentence_audio) / 2 / sample_rate) * 1000.0))
         await send_chunk(b"", sample_rate, timestamps_payload, 0, sentence_end_ms)
@@ -426,18 +429,21 @@ class OmniStreamingSpeechHandler:
         text: str,
         sample_rate: int,
         config,
+        language: str | None = None,
     ) -> list[dict] | None:
         """Align a whole sentence and return monotonic word timestamps.
 
         Returns ``None`` when the aligner fails (clients render this as
         "timestamps unavailable"); an empty list means the aligner ran but
-        produced no tokens.
+        produced no tokens. ``language`` is forwarded to the aligner's word
+        segmentation (see :func:`forced_align`).
         """
         aligned = await forced_align(
             audio=audio,
             text=text,
             sample_rate=sample_rate,
             config=config,
+            language=language,
         )
         if aligned is None:
             return None
