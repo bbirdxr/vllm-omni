@@ -947,7 +947,10 @@ class Orchestrator:
         from vllm_omni.engine.async_omni_engine import _upgrade_to_omni_request
 
         proc = self._get_stage_input_processor(stage_id)
-        supported_tasks = tuple(getattr(proc.vllm_config.model_config, "supported_tasks", ()) or ("encode",))
+        # SPIKE: the aligner is a token_classify pooling model. vLLM validates
+        # PoolingParams.task against the supported pooling tasks, so advertise it.
+        model_supported = tuple(getattr(proc.vllm_config.model_config, "supported_tasks", ()) or ())
+        supported_tasks = model_supported or ("token_classify",)
         request = proc.process_inputs(
             request_id=req_id,
             prompt=next_input,

@@ -225,7 +225,21 @@ class OmniGPUModelRunner(GPUModelRunner):
                 kwargs["target_h"] = target_h
             if target_w is not None:
                 kwargs["target_w"] = target_w
-            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
+            # SPIKE (explore/mfa-3stage): some stock vLLM mrope models (e.g. the
+            # forced aligner Qwen3ASRForConditionalGeneration) have an older
+            # get_mrope_input_positions signature that doesn't accept hf_config/
+            # target_* and reads them from self.config. Drop kwargs the callee
+            # doesn't declare (unless it accepts **kwargs).
+            import inspect as _inspect
+
+            _fn = self.model.get_mrope_input_positions
+            try:
+                _params = _inspect.signature(_fn).parameters
+                if not any(p.kind == _inspect.Parameter.VAR_KEYWORD for p in _params.values()):
+                    kwargs = {k: v for k, v in kwargs.items() if k in _params}
+            except (ValueError, TypeError):
+                pass
+            req_state.mrope_positions, req_state.mrope_position_delta = _fn(
                 req_state.prompt_token_ids,
                 **kwargs,
             )

@@ -2646,11 +2646,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     sampling_params_list[0].extra_args = {}
                 sampling_params_list[0].extra_args["qwen3_tts_request_seed"] = request.seed
 
+        # SPIKE (explore/mfa-3stage): when word_timestamps is requested, also ask
+        # for the aligner stage's output so the orchestrator drives the request
+        # through the forced-aligner stage (final_stage_id extends to it). If no
+        # aligner stage exists, "timestamps" is filtered out (harmless warning).
+        output_modalities = ["audio"]
+        if getattr(request, "word_timestamps", False):
+            output_modalities.append("timestamps")
+
         generator = self.engine_client.generate(
             prompt=prompt,
             request_id=request_id,
             sampling_params_list=sampling_params_list,
-            output_modalities=["audio"],
+            output_modalities=output_modalities,
         )
         return request_id, generator, tts_params
 
