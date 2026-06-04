@@ -35,6 +35,58 @@ from vllm_omni.utils.qwen3_force_align_processor import build_prompt, segment_wo
 
 logger = init_logger(__name__)
 
+# Shared keys / names for the forced-aligner stage payloads, so the producer
+# (this processor), the worker-side decode, and the serving consumer don't
+# duplicate magic strings.
+ALIGNER_WORDS_KEY = "aligner_words"
+WORD_TIMESTAMPS_MS_KEY = "word_timestamps_ms"
+TIMESTAMPS_MODALITY = "timestamps"
+# Dotted path of the pooling-output decoder hook (read by the AR scheduler for
+# a stage whose engine_args set ``pooling_output_decoder``).
+POOLING_OUTPUT_DECODER_PATH = "vllm_omni.model_executor.stage_input_processors.forced_aligner.decode_pooling_output"
+
+
+def decode_pooling_output(logits: Any, request: Any, hf_config: Any) -> dict[str, Any]:
+    """Worker-side decoder for the forced-aligner pooling stage.
+
+    Converts the aligner's ``[n_token, classify_num]`` logits into per-word
+    start/end times and returns an omni payload ``dict[str, Tensor]`` (word
+    strings travel via ``additional_information``). This runs in the stage
+    worker before IPC serialization, so the cross-process payload is a dict
+    (matching omni's patched ``pooling_output`` schema) rather than a bare
+    tensor. Used via the generic ``pooling_output_decoder`` stage hook.
+    """
+    import torch
+
+    from vllm_omni.engine.serialization import deserialize_additional_information
+    from vllm_omni.utils.forced_aligner import _decode_timestamps
+
+    ts_id = int(getattr(hf_config, "timestamp_token_id"))
+    thinker_cfg = getattr(hf_config, "thinker_config", hf_config)
+    classify_num = int(getattr(thinker_cfg, "classify_num"))
+    seg_ms = float(getattr(hf_config, "timestamp_segment_time"))
+
+    prompt_token_ids = list(getattr(request, "prompt_token_ids", []) or [])
+    positions = [i for i, t in enumerate(prompt_token_ids) if t == ts_id]
+
+    info = deserialize_additional_information(getattr(request, "additional_information", None)) or {}
+    words_field = info.get(ALIGNER_WORDS_KEY)
+    words = words_field[0] if isinstance(words_field, list) and words_field else []
+
+    timestamps = _decode_timestamps(
+        logits=logits,
+        words=list(words),
+        timestamp_positions=positions,
+        classify_num=classify_num,
+        timestamp_segment_time_ms=seg_ms,
+        audio_duration_ms=0.0,
+    )
+    ms = torch.tensor(
+        [[t.start_ms, t.end_ms] for t in timestamps] or [[0, 0]],
+        dtype=torch.int32,
+    )
+    return {WORD_TIMESTAMPS_MS_KEY: ms}
+
 
 def _extract_waveform(multimodal_output: dict[str, Any]) -> tuple[np.ndarray, int]:
     """Pull a mono float32 waveform + sample rate from a Code2Wav output."""
@@ -108,7 +160,7 @@ def code2wav2aligner(
 
         additional_information: dict[str, Any] = {
             "text": [text],
-            "aligner_words": [words],
+            ALIGNER_WORDS_KEY: [words],
         }
         if language_list is not None:
             additional_information["language"] = language_list

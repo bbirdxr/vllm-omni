@@ -112,14 +112,20 @@ _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
 
 
-def _spike_extract_word_timestamps(res: Any) -> list[dict] | None:
-    """SPIKE (explore/mfa-3stage): pull word timestamps from an aligner-stage output.
+def _extract_word_timestamps(res: Any, fallback_words: list[str] | None = None) -> list[dict] | None:
+    """Pull word timestamps from a forced-aligner stage output.
 
-    The aligner stage emits a pooling payload ``{"word_timestamps_ms": int32
-    [n_words, 2]}`` plus ``aligner_words`` in additional_information. Returns a
-    list of ``{word, start_ms, end_ms}`` if this output is from the aligner,
-    else ``None``.
+    The aligner stage emits a pooling payload ``{word_timestamps_ms: int32
+    [n_words, 2]}``; word strings come from ``aligner_words`` in
+    additional_information, or ``fallback_words`` (re-segmented request text)
+    when not present. Returns ``[{word, start_ms, end_ms}, ...]`` if this output
+    is from the aligner, else ``None``.
     """
+    from vllm_omni.model_executor.stage_input_processors.forced_aligner import (
+        ALIGNER_WORDS_KEY,
+        WORD_TIMESTAMPS_MS_KEY,
+    )
+
     try:
         outs = getattr(res, "outputs", None)
         if outs is None:
@@ -129,18 +135,18 @@ def _spike_extract_word_timestamps(res: Any) -> list[dict] | None:
         payload = None
         for attr in ("data", "multimodal_output"):
             cand = getattr(out0, attr, None)
-            if isinstance(cand, dict) and "word_timestamps_ms" in cand:
+            if isinstance(cand, dict) and WORD_TIMESTAMPS_MS_KEY in cand:
                 payload = cand
                 break
         if payload is None:
             return None
-        ms = payload["word_timestamps_ms"]
+        ms = payload[WORD_TIMESTAMPS_MS_KEY]
         ms_list = ms.tolist() if hasattr(ms, "tolist") else list(ms)
 
-        words: list[str] = []
+        words: list[str] = list(fallback_words or [])
         info = getattr(res, "additional_information", None) or getattr(out0, "additional_information", None)
         if isinstance(info, dict):
-            wf = info.get("aligner_words")
+            wf = info.get(ALIGNER_WORDS_KEY)
             if isinstance(wf, list) and wf:
                 words = list(wf[0]) if isinstance(wf[0], list) else list(wf)
 
@@ -154,6 +160,7 @@ def _spike_extract_word_timestamps(res: Any) -> list[dict] | None:
             })
         return result
     except Exception:
+        logger.debug("failed to extract word timestamps from aligner output", exc_info=True)
         return None
 
 
@@ -2691,13 +2698,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     sampling_params_list[0].extra_args = {}
                 sampling_params_list[0].extra_args["qwen3_tts_request_seed"] = request.seed
 
-        # SPIKE (explore/mfa-3stage): when word_timestamps is requested, also ask
-        # for the aligner stage's output so the orchestrator drives the request
-        # through the forced-aligner stage (final_stage_id extends to it). If no
-        # aligner stage exists, "timestamps" is filtered out (harmless warning).
+        # When word_timestamps is requested, also ask for the aligner stage's
+        # output so the orchestrator drives the request through the forced-aligner
+        # stage (final_stage_id extends to it). If no aligner stage exists, the
+        # extra modality is filtered out (harmless warning).
         output_modalities = ["audio"]
         if getattr(request, "word_timestamps", False):
-            output_modalities.append("timestamps")
+            from vllm_omni.model_executor.stage_input_processors.forced_aligner import TIMESTAMPS_MODALITY
+
+            output_modalities.append(TIMESTAMPS_MODALITY)
 
         generator = self.engine_client.generate(
             prompt=prompt,
@@ -2744,25 +2753,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         moss_sample_rate: int | None = None
 
         final_output: OmniRequestOutput | None = None
+        word_timestamps: list[dict] | None = None
         async for res in generator:
-            # SPIKE (explore/mfa-3stage): the forced-aligner stage emits a
-            # pooling output carrying word_timestamps_ms. Capture it and do NOT
-            # treat it as audio (it would crash _extract_audio_output).
-            ts = _spike_extract_word_timestamps(res)
-            if ts is not None:
-                # Pair the decoded times with words re-segmented from the
-                # request text (same segmentation the aligner used, in order).
-                if any(not t["word"] for t in ts):
-                    try:
-                        from vllm_omni.utils.qwen3_force_align_processor import segment_words
+            # The forced-aligner stage emits a pooling output carrying
+            # word_timestamps_ms. Capture it and do NOT treat it as audio
+            # (it would crash _extract_audio_output).
+            # Forced-aligner stage emits word timestamps as a pooling output;
+            # re-segment the request text as fallback word labels (same
+            # segmentation the aligner used, in order).
+            fallback_words = None
+            try:
+                from vllm_omni.utils.qwen3_force_align_processor import segment_words
 
-                        _words = segment_words(request.input, getattr(request, "language", None))
-                        for _i, _t in enumerate(ts):
-                            if not _t["word"] and _i < len(_words):
-                                _t["word"] = _words[_i]
-                    except Exception:
-                        logger.debug("[aligner] failed to attach word labels", exc_info=True)
-                logger.info("[aligner] word timestamps: %s", ts)
+                fallback_words = segment_words(request.input, getattr(request, "language", None))
+            except Exception:
+                logger.debug("failed to re-segment request text for word labels", exc_info=True)
+            ts = _extract_word_timestamps(res, fallback_words=fallback_words)
+            if ts is not None:
+                word_timestamps = ts
+                # TODO: carry word_timestamps into the response protocol; for now
+                # they are surfaced via the log (non-stream WAV has no field).
+                logger.info("word timestamps: %s", ts)
                 continue
             final_output = res
             if not is_moss:

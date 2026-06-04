@@ -898,6 +898,12 @@ def _inject_forced_aligner_stage(
     if fa is None:
         return pipeline, deploy
 
+    from vllm_omni.model_executor.stage_input_processors.forced_aligner import (
+        POOLING_OUTPUT_DECODER_PATH,
+        TIMESTAMPS_MODALITY,
+    )
+
+    _PROC = "vllm_omni.model_executor.stage_input_processors.forced_aligner"
     new_id = len(pipeline.stages)
     aligner_ps = StagePipelineConfig(
         stage_id=new_id,
@@ -905,17 +911,20 @@ def _inject_forced_aligner_stage(
         execution_type=StageExecutionType.LLM_POOLING,
         input_sources=(new_id - 1,),
         final_output=True,
-        final_output_type="timestamps",
+        final_output_type=TIMESTAMPS_MODALITY,
         owns_tokenizer=True,
         requires_multimodal_data=True,
         model_arch=fa.architecture,
-        custom_process_input_func=(
-            "vllm_omni.model_executor.stage_input_processors.forced_aligner.code2wav2aligner"
-        ),
+        custom_process_input_func=f"{_PROC}.code2wav2aligner",
     )
     extended = dataclasses.replace(pipeline, stages=pipeline.stages + (aligner_ps,))
 
-    engine_extras: dict[str, Any] = {"model": fa.model, "runner": fa.runner or "pooling"}
+    engine_extras: dict[str, Any] = {
+        "model": fa.model,
+        "runner": fa.runner or "pooling",
+        # Worker-side decoder hook: pooler logits -> word-timestamps payload.
+        "pooling_output_decoder": POOLING_OUTPUT_DECODER_PATH,
+    }
     if fa.architecture:
         engine_extras["hf_overrides"] = {"architectures": [fa.architecture]}
     if fa.trust_remote_code is not None:

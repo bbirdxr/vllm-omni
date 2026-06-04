@@ -125,6 +125,10 @@ class OmniModelConfig(ModelConfig):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
+    # Optional dotted path of a per-stage pooling-output decoder (e.g. the
+    # forced-aligner stage converts pooler logits to a word-timestamps payload
+    # worker-side before IPC). Read by the AR scheduler.
+    pooling_output_decoder: str | None = None
     stage_connector_config: dict[str, Any] = field(
         default_factory=lambda: {
             "name": "SharedMemoryConnector",

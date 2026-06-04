@@ -51,15 +51,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     core scheduling logic.
     """
 
-    def _maybe_decode_aligner_output(self, request: Any, pooler_output: Any) -> Any:
-        """SPIKE (explore/mfa-3stage): decode a forced-aligner pooling output.
+    def _decode_pooling_output(self, request: Any, pooler_output: Any) -> Any:
+        """Apply a per-stage pooling-output decoder hook, if configured.
 
-        The aligner's pooler returns a bare ``[n_token, classify_num]`` tensor.
-        Sending that across the stage IPC fails because omni patched
-        ``EngineCoreOutput.pooling_output`` to ``dict[str, Tensor]``. So decode
-        it to word timestamps here (worker side) and emit a small dict payload
-        ``{"word_timestamps": [...]}`` that both serializes cleanly and is the
-        final result. Non-aligner pooling/AR outputs pass through unchanged.
+        A stage may set ``pooling_output_decoder`` (a dotted path) in its
+        engine_args to convert a bare pooler tensor into an omni payload
+        ``dict[str, Tensor]`` before IPC serialization (omni patched
+        ``EngineCoreOutput.pooling_output`` to a dict, so a bare tensor would
+        fail to cross the stage boundary). When unset, the output passes
+        through unchanged. This keeps model-specific decode logic out of the
+        generic scheduler (the forced aligner supplies its own decoder).
         """
         if pooler_output is None or getattr(request, "pooling_params", None) is None:
             return pooler_output
@@ -67,44 +68,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         if not isinstance(pooler_output, _torch.Tensor):
             return pooler_output
+        if self._pooling_output_decoder is None:
+            return pooler_output
         try:
-            hf_config = self.vllm_config.model_config.hf_config
-            if self._aligner_timestamp_token_id is None:
-                self._aligner_timestamp_token_id = int(getattr(hf_config, "timestamp_token_id"))
-            ts_id = self._aligner_timestamp_token_id
-            thinker_cfg = getattr(hf_config, "thinker_config", hf_config)
-            classify_num = int(getattr(thinker_cfg, "classify_num"))
-            seg_ms = float(getattr(hf_config, "timestamp_segment_time"))
-
-            prompt_token_ids = list(getattr(request, "prompt_token_ids", []) or [])
-            positions = [i for i, t in enumerate(prompt_token_ids) if t == ts_id]
-
-            info = deserialize_additional_information(getattr(request, "additional_information", None)) or {}
-            words_field = info.get("aligner_words")
-            words = words_field[0] if isinstance(words_field, list) and words_field else []
-
-            from vllm_omni.utils.forced_aligner import _decode_timestamps
-
-            timestamps = _decode_timestamps(
-                logits=pooler_output,
-                words=list(words),
-                timestamp_positions=positions,
-                classify_num=classify_num,
-                timestamp_segment_time_ms=seg_ms,
-                audio_duration_ms=0.0,
+            return self._pooling_output_decoder(
+                pooler_output,
+                request,
+                self.vllm_config.model_config.hf_config,
             )
-            # omni's pooling_output payload is dict[str, Tensor]; word strings
-            # travel via additional_information (aligner_words). Carry the times
-            # as an int32 [n_words, 2] (start_ms, end_ms) tensor; serving zips
-            # them back with the words.
-            ms = _torch.tensor(
-                [[t.start_ms, t.end_ms] for t in timestamps] or [[0, 0]],
-                dtype=_torch.int32,
-            )
-            return {"word_timestamps_ms": ms}
         except Exception:
-            logger.exception("[aligner] failed to decode pooling output; wrapping raw tensor")
-            return {"aligner_logits": pooler_output}
+            logger.exception("[pooling] decoder hook failed; dropping pooler output")
+            return None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -131,9 +105,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Cache per-request flag to avoid repeated deserialization of additional_information
         self._omits_kv_transfer_cache: dict[str, bool] = {}
-        # SPIKE (explore/mfa-3stage): cached <timestamp> token id for the
-        # forced-aligner stage, resolved lazily from the model hf_config.
-        self._aligner_timestamp_token_id: int | None = None
+        # Optional per-stage pooling-output decoder hook (dotted path in
+        # engine_args -> model_config). Used e.g. by the forced-aligner stage to
+        # turn pooler logits into a word-timestamps payload worker-side.
+        self._pooling_output_decoder = None
+        _decoder_path = getattr(self.vllm_config.model_config, "pooling_output_decoder", None)
+        if _decoder_path:
+            import importlib
+
+            _mod, _fn = str(_decoder_path).rsplit(".", 1)
+            self._pooling_output_decoder = getattr(importlib.import_module(_mod), _fn)
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
@@ -518,7 +499,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            pooling_output_payload = self._maybe_decode_aligner_output(request, pooler_output)
+            pooling_output_payload = self._decode_pooling_output(request, pooler_output)
             if new_token_ids or pooling_output_payload is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
