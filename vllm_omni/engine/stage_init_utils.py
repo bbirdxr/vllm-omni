@@ -726,6 +726,12 @@ def build_engine_args_dict(
     stage_defines_tokenizer = (
         engine_args_dict.get("tokenizer") is not None or engine_args_dict.get("tokenizer_subdir") is not None
     )
+    # SPIKE (explore/mfa-3stage): a stage may carry its own model path (e.g. an
+    # injected forced-aligner stage that is a separate checkpoint, not a
+    # submodule of the served model). Honor it instead of the served model.
+    stage_level_model = engine_args_dict.get("model")
+    if stage_level_model:
+        model = str(stage_level_model)
     model = _resolve_model_tokenizer_paths(model, engine_args_dict)
     apply_cli_tokenizer(
         engine_args_dict,
