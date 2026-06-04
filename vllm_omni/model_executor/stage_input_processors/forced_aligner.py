@@ -78,19 +78,18 @@ def code2wav2aligner(
     prompt: Any = None,
     _requires_multimodal_data: bool = False,
     _streaming_context: Any | None = None,
-    *,
-    encode_prompt: Any | None = None,
 ) -> list[Any]:
     """Build forced-aligner stage inputs from finished Code2Wav audio.
 
-    ``encode_prompt`` is an injectable ``str -> list[int]`` tokenizer hook
-    (the aligner tokenizer). When ``None`` the prompt string is carried in
-    ``additional_information`` so the stage worker can tokenize it; this keeps
-    the processor unit-testable without loading a tokenizer.
+    Emits a **text prompt** (``prompt`` string + ``multi_modal_data`` audio).
+    Tokenization and audio feature extraction are deferred to the aligner
+    stage's input preprocessor (run by the orchestrator), so this function
+    needs neither the aligner tokenizer nor its mm processor and stays
+    unit-testable on CPU.
     """
-    from vllm_omni.inputs.data import OmniTokensPrompt
+    from vllm_omni.inputs.data import OmniTextPrompt
 
-    aligner_inputs: list[OmniTokensPrompt] = []
+    aligner_inputs: list[OmniTextPrompt] = []
     for i, src in enumerate(source_outputs):
         if not getattr(src, "finished", False):
             # Sentence-final alignment: only run once the audio is complete.
@@ -114,19 +113,10 @@ def code2wav2aligner(
         if language_list is not None:
             additional_information["language"] = language_list
 
-        if encode_prompt is not None:
-            prompt_token_ids = list(encode_prompt(prompt_str))
-        else:
-            # No tokenizer available here: defer tokenization to the stage
-            # worker, which owns the aligner tokenizer.
-            prompt_token_ids = []
-            additional_information["aligner_prompt"] = [prompt_str]
-
         aligner_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=prompt_token_ids,
+            OmniTextPrompt(
+                prompt=prompt_str,
                 multi_modal_data={"audio": (wav_np, sample_rate)},
-                mm_processor_kwargs=None,
                 additional_information=additional_information,
             )
         )

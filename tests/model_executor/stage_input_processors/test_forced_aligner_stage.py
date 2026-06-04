@@ -45,43 +45,21 @@ def test_extract_text_unwraps_additional_information_list():
     assert _extract_text(prompt) == "Hello world."
 
 
-def test_code2wav2aligner_builds_prompt_and_audio_with_injected_tokenizer():
-    captured = {}
-
-    def fake_encode(s):
-        captured["prompt"] = s
-        return [1, 2, 3]
-
+def test_code2wav2aligner_builds_text_prompt_and_audio():
     prompt = {"additional_information": {"text": ["U.S.A test"], "language": ["English"]}}
-    out = code2wav2aligner(
-        [_FakeOutput(_audio_mm())],
-        prompt,
-        False,
-        None,
-        encode_prompt=fake_encode,
-    )
-
-    assert len(out) == 1
-    item = out[0]
-    assert item["prompt_token_ids"] == [1, 2, 3]
-    # audio carried as (np.float32, sr) tuple
-    audio, sr = item["multi_modal_data"]["audio"]
-    assert isinstance(audio, np.ndarray) and sr == 24000
-    # prompt built from official segmentation: "U.S.A" -> "USA"
-    assert "USA<timestamp><timestamp>test" in captured["prompt"]
-    assert item["additional_information"]["aligner_words"] == [["USA", "test"]]
-
-
-def test_code2wav2aligner_defers_tokenization_when_no_tokenizer():
-    prompt = {"additional_information": {"text": ["hello world"]}}
     out = code2wav2aligner([_FakeOutput(_audio_mm())], prompt)
 
     assert len(out) == 1
     item = out[0]
-    # no tokenizer -> empty ids, prompt string deferred to the stage worker
-    assert item["prompt_token_ids"] == []
-    assert "aligner_prompt" in item["additional_information"]
-    assert "<timestamp>" in item["additional_information"]["aligner_prompt"][0]
+    # text prompt: tokenization + audio features deferred to the stage preprocessor
+    assert "prompt_token_ids" not in item
+    # prompt built from official segmentation: "U.S.A" -> "USA"
+    assert "USA<timestamp><timestamp>test" in item["prompt"]
+    # audio carried as (np.float32, sr) tuple
+    audio, sr = item["multi_modal_data"]["audio"]
+    assert isinstance(audio, np.ndarray) and sr == 24000
+    assert item["additional_information"]["aligner_words"] == [["USA", "test"]]
+    assert item["additional_information"]["language"] == ["English"]
 
 
 def test_code2wav2aligner_skips_unfinished_and_empty():

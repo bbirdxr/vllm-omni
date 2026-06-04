@@ -187,6 +187,12 @@ class Orchestrator:
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._cfg_tracker = CfgCompanionTracker()
+        # SPIKE (explore/mfa-3stage): lazily-built per-stage input processors for
+        # downstream stages that consume a fresh multimodal input (e.g. a forced
+        # aligner stage that ingests Code2Wav audio). Stage-0 has its own
+        # processor in the engine; intermediate stages don't, so we build one
+        # on demand from the stage's vllm_config.
+        self._stage_input_processors: dict[int, Any] = {}
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
@@ -912,6 +918,47 @@ class Orchestrator:
         )
         return sp
 
+    def _get_stage_input_processor(self, stage_id: int) -> Any:
+        """SPIKE (explore/mfa-3stage): lazily build an input processor for a
+        downstream stage that ingests a fresh multimodal input (e.g. a forced
+        aligner stage consuming Code2Wav audio). Cached per stage_id.
+        """
+        proc = self._stage_input_processors.get(stage_id)
+        if proc is None:
+            from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
+
+            proc = build_stage0_input_processor(self.stage_pools[stage_id].stage_vllm_config)
+            self._stage_input_processors[stage_id] = proc
+        return proc
+
+    def _build_mm_stage_request(
+        self,
+        *,
+        req_id: str,
+        stage_id: int,
+        next_input: Any,
+        params: Any,
+        resumable: bool,
+    ) -> Any:
+        """SPIKE: build a request for a downstream stage from a text+mm prompt
+        by running that stage's own input preprocessor (tokenize + audio
+        features). Used for the forced-aligner pooling stage.
+        """
+        from vllm_omni.engine.async_omni_engine import _upgrade_to_omni_request
+
+        proc = self._get_stage_input_processor(stage_id)
+        supported_tasks = tuple(getattr(proc.vllm_config.model_config, "supported_tasks", ()) or ("encode",))
+        request = proc.process_inputs(
+            request_id=req_id,
+            prompt=next_input,
+            params=params,
+            supported_tasks=supported_tasks,
+            resumable=resumable,
+        )
+        request = _upgrade_to_omni_request(request, next_input)
+        request.external_req_id = req_id
+        return request
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -1059,18 +1106,31 @@ class Orchestrator:
 
         # Build and submit requests for each input
         for next_input in next_inputs:
-            # Only AR thinker stages consume encoder mm_features; downstream
-            # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
-            model_stage = getattr(next_client, "model_stage", None)
-            mm_features = req_state.mm_features if model_stage == "thinker" else None
-            request = build_engine_core_request_from_tokens(
-                request_id=req_id,
-                prompt=next_input,
-                params=params,
-                model_config=next_pool.stage_vllm_config.model_config,
-                mm_features=mm_features,
-                resumable=next_stage_resumable,
-            )
+            # SPIKE (explore/mfa-3stage): a downstream stage that ingests a
+            # fresh multimodal input (forced aligner consuming Code2Wav audio)
+            # arrives as a text+mm prompt. Run that stage's own preprocessor so
+            # the audio becomes mm_features and the prompt is tokenized.
+            if isinstance(next_input, dict) and next_input.get("multi_modal_data"):
+                request = self._build_mm_stage_request(
+                    req_id=req_id,
+                    stage_id=next_logical,
+                    next_input=next_input,
+                    params=params,
+                    resumable=next_stage_resumable,
+                )
+            else:
+                # Only AR thinker stages consume encoder mm_features; downstream
+                # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
+                model_stage = getattr(next_client, "model_stage", None)
+                mm_features = req_state.mm_features if model_stage == "thinker" else None
+                request = build_engine_core_request_from_tokens(
+                    request_id=req_id,
+                    prompt=next_input,
+                    params=params,
+                    model_config=next_pool.stage_vllm_config.model_config,
+                    mm_features=mm_features,
+                    resumable=next_stage_resumable,
+                )
 
             request.external_req_id = request.request_id
             if already_submitted:
