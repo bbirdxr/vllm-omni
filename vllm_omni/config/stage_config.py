@@ -135,6 +135,11 @@ class StageExecutionType(str, Enum):
     LLM_AR = "llm_ar"
     LLM_GENERATION = "llm_generation"
     DIFFUSION = "diffusion"
+    # SPIKE (explore/mfa-3stage): pooling/token_classify stage, e.g. a forced
+    # aligner running as a post-TTS stage. Reuses the AR worker (which already
+    # has the is_pooling_model -> _pool() path) and the sync AR scheduler
+    # (which finishes a request as soon as pooler_output is produced).
+    LLM_POOLING = "llm_pooling"
 
 
 def _resolve_scheduler(
@@ -153,6 +158,10 @@ def _resolve_scheduler(
         return OmniARAsyncScheduler
     if execution_type == StageExecutionType.LLM_GENERATION:
         return OmniGenerationScheduler
+    if execution_type == StageExecutionType.LLM_POOLING:
+        # SPIKE: pooling has no async path; the sync AR scheduler already
+        # finishes a request once pooler_output is set (see omni_ar_scheduler).
+        return OmniARScheduler
     # Diffusion currently returns None here.
     return None
 
@@ -735,6 +744,9 @@ _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str |
     StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
     StageExecutionType.LLM_GENERATION: (StageType.LLM, "generation"),
     StageExecutionType.DIFFUSION: (StageType.DIFFUSION, None),
+    # SPIKE: pooling stage reuses the AR worker (pooling hooks live in the
+    # shared GPU model runner). Distinct worker_type so it can diverge later.
+    StageExecutionType.LLM_POOLING: (StageType.LLM, "pooling"),
 }
 
 

@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
@@ -204,6 +205,9 @@ def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
         engine_args["worker_cls"] = current_omni_platform.get_omni_ar_worker_cls()
     elif worker_type == "generation":
         engine_args["worker_cls"] = current_omni_platform.get_omni_generation_worker_cls()
+    elif worker_type == "pooling":
+        # SPIKE (explore/mfa-3stage): forced-aligner / token_classify stage.
+        engine_args["worker_cls"] = current_omni_platform.get_omni_pooling_worker_cls()
     else:
         raise ValueError(f"Unknown worker_type: {worker_type}")
 
@@ -394,8 +398,16 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     final_output_type: str | None = getattr(stage_config, "final_output_type", None)
 
     default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
-    SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-    default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
+    # SPIKE (explore/mfa-3stage): a pooling stage (forced aligner) is driven by
+    # PoolingParams, not SamplingParams. The orchestrator's request builder
+    # already branches on the param type.
+    if stage_type == "llm" and str(engine_args.get("worker_type", "")).lower() == "pooling":
+        default_pp = _to_dict(getattr(stage_config, "default_pooling_params", {}))
+        default_sampling_params: OmniSamplingParams = PoolingParams(**default_pp)
+    elif stage_type == "llm":
+        default_sampling_params = SamplingParams(**default_sp)
+    else:
+        default_sampling_params = OmniDiffusionSamplingParams(**default_sp)
 
     custom_process_input_func: Callable | None = None
     _cpif_path = getattr(stage_config, "custom_process_input_func", None)
