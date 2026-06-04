@@ -112,6 +112,50 @@ _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
 
 
+def _spike_extract_word_timestamps(res: Any) -> list[dict] | None:
+    """SPIKE (explore/mfa-3stage): pull word timestamps from an aligner-stage output.
+
+    The aligner stage emits a pooling payload ``{"word_timestamps_ms": int32
+    [n_words, 2]}`` plus ``aligner_words`` in additional_information. Returns a
+    list of ``{word, start_ms, end_ms}`` if this output is from the aligner,
+    else ``None``.
+    """
+    try:
+        outs = getattr(res, "outputs", None)
+        if not outs:
+            return None
+        out0 = outs[0]
+        payload = None
+        for attr in ("data", "multimodal_output"):
+            cand = getattr(out0, attr, None)
+            if isinstance(cand, dict) and "word_timestamps_ms" in cand:
+                payload = cand
+                break
+        if payload is None:
+            return None
+        ms = payload["word_timestamps_ms"]
+        ms_list = ms.tolist() if hasattr(ms, "tolist") else list(ms)
+
+        words: list[str] = []
+        info = getattr(res, "additional_information", None) or getattr(out0, "additional_information", None)
+        if isinstance(info, dict):
+            wf = info.get("aligner_words")
+            if isinstance(wf, list) and wf:
+                words = list(wf[0]) if isinstance(wf[0], list) else list(wf)
+
+        result = []
+        for i, pair in enumerate(ms_list):
+            start_ms, end_ms = (int(pair[0]), int(pair[1])) if len(pair) >= 2 else (0, 0)
+            result.append({
+                "word": words[i] if i < len(words) else "",
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+            })
+        return result
+    except Exception:
+        return None
+
+
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
     """Create a WAV header with placeholder size values for streaming.
 
@@ -2700,6 +2744,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         final_output: OmniRequestOutput | None = None
         async for res in generator:
+            # SPIKE (explore/mfa-3stage): the forced-aligner stage emits a
+            # pooling output carrying word_timestamps_ms. Capture it and do NOT
+            # treat it as audio (it would crash _extract_audio_output).
+            try:
+                _o = getattr(res, "outputs", None)
+                _o0 = _o[0] if isinstance(_o, (list, tuple)) and _o else _o
+                logger.info(
+                    "[aligner-dbg] res=%s outputs_type=%s out0_type=%s out0_attrs=%s data_type=%s mm=%s",
+                    type(res).__name__,
+                    type(_o).__name__,
+                    type(_o0).__name__,
+                    [a for a in dir(_o0) if not a.startswith("__")][:20] if _o0 is not None else None,
+                    type(getattr(_o0, "data", None)).__name__,
+                    type(getattr(_o0, "multimodal_output", None)).__name__,
+                )
+            except Exception as _e:
+                logger.info("[aligner-dbg] introspect failed: %s", _e)
+            ts = _spike_extract_word_timestamps(res)
+            if ts is not None:
+                logger.info("[aligner] word timestamps (ms): %s", ts)
+                continue
             final_output = res
             if not is_moss:
                 continue
