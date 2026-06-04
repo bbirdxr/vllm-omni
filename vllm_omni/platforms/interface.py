@@ -64,7 +64,7 @@ class OmniPlatform(Platform):
 
     @classmethod
     def get_omni_pooling_worker_cls(cls) -> str:
-        # SPIKE (explore/mfa-3stage): worker for a pooling/token_classify stage.
+        # worker for a pooling/token_classify stage.
         raise NotImplementedError
 
     @classmethod

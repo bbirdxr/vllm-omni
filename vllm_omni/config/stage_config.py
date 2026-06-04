@@ -135,7 +135,7 @@ class StageExecutionType(str, Enum):
     LLM_AR = "llm_ar"
     LLM_GENERATION = "llm_generation"
     DIFFUSION = "diffusion"
-    # SPIKE (explore/mfa-3stage): pooling/token_classify stage, e.g. a forced
+    # pooling/token_classify stage, e.g. a forced
     # aligner running as a post-TTS stage. Reuses the AR worker (which already
     # has the is_pooling_model -> _pool() path) and the sync AR scheduler
     # (which finishes a request as soon as pooler_output is produced).
@@ -159,7 +159,7 @@ def _resolve_scheduler(
     if execution_type == StageExecutionType.LLM_GENERATION:
         return OmniGenerationScheduler
     if execution_type == StageExecutionType.LLM_POOLING:
-        # SPIKE: pooling has no async path; the sync AR scheduler already
+        # pooling has no async path; the sync AR scheduler already
         # finishes a request once pooler_output is set (see omni_ar_scheduler).
         return OmniARScheduler
     # Diffusion currently returns None here.
@@ -744,7 +744,7 @@ _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str |
     StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
     StageExecutionType.LLM_GENERATION: (StageType.LLM, "generation"),
     StageExecutionType.DIFFUSION: (StageType.DIFFUSION, None),
-    # SPIKE: pooling stage reuses the AR worker (pooling hooks live in the
+    # pooling stage reuses the AR worker (pooling hooks live in the
     # shared GPU model runner). Distinct worker_type so it can diverge later.
     StageExecutionType.LLM_POOLING: (StageType.LLM, "pooling"),
 }
@@ -871,7 +871,7 @@ def _inject_forced_aligner_stage(
     deploy: DeployConfig,
     cli_overrides: dict[str, Any],
 ) -> tuple[PipelineConfig, DeployConfig]:
-    """SPIKE (explore/mfa-3stage): append a forced-aligner pooling stage.
+    """append a forced-aligner pooling stage.
 
     When ``--forced-aligner`` is set, tack an ``LLM_POOLING`` stage onto the
     end of the TTS pipeline (Talker -> Code2Wav -> ForcedAligner). The aligner
@@ -1292,7 +1292,7 @@ class StageConfigFactory:
             )
         pipeline_cfg = _PIPELINE_REGISTRY[pipeline_key]
 
-        # SPIKE (explore/mfa-3stage): optionally append a forced-aligner stage.
+        # optionally append a forced-aligner stage.
         pipeline_cfg, deploy_cfg = _inject_forced_aligner_stage(pipeline_cfg, deploy_cfg, cli_overrides)
 
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)

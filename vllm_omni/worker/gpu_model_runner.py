@@ -225,7 +225,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 kwargs["target_h"] = target_h
             if target_w is not None:
                 kwargs["target_w"] = target_w
-            # SPIKE (explore/mfa-3stage): some stock vLLM mrope models (e.g. the
+            # some stock vLLM mrope models (e.g. the
             # forced aligner Qwen3ASRForConditionalGeneration) have an older
             # get_mrope_input_positions signature that doesn't accept hf_config/
             # target_* and reads them from self.config. Drop kwargs the callee

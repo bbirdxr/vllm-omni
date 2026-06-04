@@ -587,7 +587,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states = model_output
                 aux_hidden_states = None
 
-            # SPIKE (explore/mfa-3stage): a pooling stage (forced aligner) skips
+            # a pooling stage (forced aligner) skips
             # the omni hidden-state prefix cache + multimodal-output extraction
             # (those assume an AR/TTS model whose output is [n_tok, hidden]); the
             # pooler produces [n_tok, classify_num] which must not be cached as

@@ -206,7 +206,7 @@ def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
     elif worker_type == "generation":
         engine_args["worker_cls"] = current_omni_platform.get_omni_generation_worker_cls()
     elif worker_type == "pooling":
-        # SPIKE (explore/mfa-3stage): forced-aligner / token_classify stage.
+        # forced-aligner / token_classify stage.
         engine_args["worker_cls"] = current_omni_platform.get_omni_pooling_worker_cls()
     else:
         raise ValueError(f"Unknown worker_type: {worker_type}")
@@ -398,7 +398,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     final_output_type: str | None = getattr(stage_config, "final_output_type", None)
 
     default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
-    # SPIKE (explore/mfa-3stage): a pooling stage (forced aligner) is driven by
+    # a pooling stage (forced aligner) is driven by
     # PoolingParams, not SamplingParams. The orchestrator's request builder
     # already branches on the param type.
     if stage_type == "llm" and str(engine_args.get("worker_type", "")).lower() == "pooling":
@@ -727,7 +727,7 @@ def build_engine_args_dict(
     stage_defines_tokenizer = (
         engine_args_dict.get("tokenizer") is not None or engine_args_dict.get("tokenizer_subdir") is not None
     )
-    # SPIKE (explore/mfa-3stage): a stage may carry its own model path (e.g. an
+    # a stage may carry its own model path (e.g. an
     # injected forced-aligner stage that is a separate checkpoint, not a
     # submodule of the served model). Honor it instead of the served model.
     stage_level_model = engine_args_dict.get("model")

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SPIKE (explore/mfa-3stage): stage input processor for a forced-aligner stage.
+"""stage input processor for a forced-aligner stage.
 
 Bridges a Code2Wav (audio) stage to a pooling forced-aligner stage:
 

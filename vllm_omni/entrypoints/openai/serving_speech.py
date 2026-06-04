@@ -2752,28 +2752,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         moss_chunks: list[Any] = []
         moss_sample_rate: int | None = None
 
-        final_output: OmniRequestOutput | None = None
-        word_timestamps: list[dict] | None = None
-        async for res in generator:
-            # The forced-aligner stage emits a pooling output carrying
-            # word_timestamps_ms. Capture it and do NOT treat it as audio
-            # (it would crash _extract_audio_output).
-            # Forced-aligner stage emits word timestamps as a pooling output;
-            # re-segment the request text as fallback word labels (same
-            # segmentation the aligner used, in order).
-            fallback_words = None
+        # Fallback word labels for the forced-aligner stage: re-segment the
+        # request text with the same processor the aligner used (same order),
+        # in case the worker payload only carries the times. Computed once.
+        aligner_fallback_words = None
+        if getattr(request, "word_timestamps", False):
             try:
                 from vllm_omni.utils.qwen3_force_align_processor import segment_words
 
-                fallback_words = segment_words(request.input, getattr(request, "language", None))
+                aligner_fallback_words = segment_words(request.input, getattr(request, "language", None))
             except Exception:
                 logger.debug("failed to re-segment request text for word labels", exc_info=True)
-            ts = _extract_word_timestamps(res, fallback_words=fallback_words)
+
+        final_output: OmniRequestOutput | None = None
+        word_timestamps: list[dict] | None = None
+        async for res in generator:
+            # The forced-aligner stage emits word timestamps as a pooling output;
+            # capture them (they ride back in the X-Word-Timestamps header) and
+            # skip the audio path (a PoolingOutput would crash _extract_audio_output).
+            ts = _extract_word_timestamps(res, fallback_words=aligner_fallback_words)
             if ts is not None:
                 word_timestamps = ts
-                # TODO: carry word_timestamps into the response protocol; for now
-                # they are surfaced via the log (non-stream WAV has no field).
-                logger.info("word timestamps: %s", ts)
                 continue
             final_output = res
             if not is_moss:
@@ -3083,7 +3082,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # response header so the body stays a plain WAV/PCM stream.
             headers = None
             if word_timestamps:
-                headers = {"X-Word-Timestamps": json.dumps(word_timestamps, ensure_ascii=False)}
+                # HTTP headers are latin-1 only; ensure_ascii escapes non-ASCII
+                # words (e.g. CJK) as \uXXXX so the client can json.loads them.
+                headers = {"X-Word-Timestamps": json.dumps(word_timestamps, ensure_ascii=True)}
             return Response(content=audio_bytes, media_type=media_type, headers=headers)
 
         except asyncio.CancelledError:

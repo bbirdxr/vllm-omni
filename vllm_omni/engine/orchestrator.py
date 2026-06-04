@@ -187,7 +187,7 @@ class Orchestrator:
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._cfg_tracker = CfgCompanionTracker()
-        # SPIKE (explore/mfa-3stage): lazily-built per-stage input processors for
+        # lazily-built per-stage input processors for
         # downstream stages that consume a fresh multimodal input (e.g. a forced
         # aligner stage that ingests Code2Wav audio). Stage-0 has its own
         # processor in the engine; intermediate stages don't, so we build one
@@ -919,7 +919,7 @@ class Orchestrator:
         return sp
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
-        """SPIKE (explore/mfa-3stage): lazily build an input processor for a
+        """lazily build an input processor for a
         downstream stage that ingests a fresh multimodal input (e.g. a forced
         aligner stage consuming Code2Wav audio). Cached per stage_id.
         """
@@ -940,14 +940,14 @@ class Orchestrator:
         params: Any,
         resumable: bool,
     ) -> Any:
-        """SPIKE: build a request for a downstream stage from a text+mm prompt
+        """build a request for a downstream stage from a text+mm prompt
         by running that stage's own input preprocessor (tokenize + audio
         features). Used for the forced-aligner pooling stage.
         """
         from vllm_omni.engine.async_omni_engine import _upgrade_to_omni_request
 
         proc = self._get_stage_input_processor(stage_id)
-        # SPIKE: the aligner is a token_classify pooling model. vLLM validates
+        # the aligner is a token_classify pooling model. vLLM validates
         # PoolingParams.task against the supported pooling tasks, so advertise it.
         model_supported = tuple(getattr(proc.vllm_config.model_config, "supported_tasks", ()) or ())
         supported_tasks = model_supported or ("token_classify",)
@@ -1109,7 +1109,7 @@ class Orchestrator:
 
         # Build and submit requests for each input
         for next_input in next_inputs:
-            # SPIKE (explore/mfa-3stage): a downstream stage that ingests a
+            # a downstream stage that ingests a
             # fresh multimodal input (forced aligner consuming Code2Wav audio)
             # arrives as a text+mm prompt. Run that stage's own preprocessor so
             # the audio becomes mm_features and the prompt is tokenized.

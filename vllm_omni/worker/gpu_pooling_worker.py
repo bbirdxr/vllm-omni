@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SPIKE (explore/mfa-3stage): GPU worker for a pooling/token_classify stage.
+"""GPU worker for a pooling/token_classify stage.
 
 This is a feasibility skeleton for running a ``runner="pooling"`` model (e.g.
 Qwen3-ForcedAligner) as an Omni pipeline stage rather than as an in-process

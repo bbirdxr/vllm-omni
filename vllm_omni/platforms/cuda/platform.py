@@ -34,7 +34,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def get_omni_pooling_worker_cls(cls) -> str:
-        # SPIKE (explore/mfa-3stage): pooling stage worker (forced aligner).
+        # pooling stage worker (forced aligner).
         return "vllm_omni.worker.gpu_pooling_worker.GPUPoolingWorker"
 
     @classmethod
