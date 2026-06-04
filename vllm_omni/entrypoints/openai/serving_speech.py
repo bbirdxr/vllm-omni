@@ -513,7 +513,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model=self.model_name,
         )
         try:
-            _audio_bytes, _media_type = await self._generate_audio_bytes(warmup_req, request_id="speech-warmup")
+            _audio_bytes, _media_type, _ = await self._generate_audio_bytes(warmup_req, request_id="speech-warmup")
         except Exception as exc:
             logger.warning("Speech warmup failed (non-fatal): %s", exc)
             return
@@ -2858,7 +2858,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             base64_encode=base64_encode,
         )
         audio_response: AudioResponse = self.create_audio(audio_obj)
-        return audio_response.audio_data, audio_response.media_type
+        return audio_response.audio_data, audio_response.media_type, word_timestamps
 
     async def _create_diffusion_speech(
         self,
@@ -3069,7 +3069,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     media_type=media_type,
                 )
 
-            audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
+            audio_bytes, media_type, word_timestamps = await self._generate_audio_bytes(
+                request, request_id=request_id
+            )
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.info(
                 "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
@@ -3077,7 +3079,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
                 len(audio_bytes) if isinstance(audio_bytes, (bytes, bytearray)) else len(str(audio_bytes)),
             )
-            return Response(content=audio_bytes, media_type=media_type)
+            # Word timestamps (issue #3631) ride alongside the binary audio in a
+            # response header so the body stays a plain WAV/PCM stream.
+            headers = None
+            if word_timestamps:
+                headers = {"X-Word-Timestamps": json.dumps(word_timestamps, ensure_ascii=False)}
+            return Response(content=audio_bytes, media_type=media_type, headers=headers)
 
         except asyncio.CancelledError:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
@@ -3177,7 +3184,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if validation_error is not None:
                 return SpeechBatchItemResult(index=idx, status="error", error=validation_error)
             try:
-                audio_data, media_type = await self._generate_audio_bytes(req, base64_encode=True)
+                audio_data, media_type, _ = await self._generate_audio_bytes(req, base64_encode=True)
             except Exception as e:
                 logger.exception("Batch item %d failed: %s", idx, e)
                 return SpeechBatchItemResult(index=idx, status="error", error=str(e))
