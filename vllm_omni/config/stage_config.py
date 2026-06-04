@@ -866,6 +866,75 @@ def _build_extras(
     return extras
 
 
+def _inject_forced_aligner_stage(
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+    cli_overrides: dict[str, Any],
+) -> tuple[PipelineConfig, DeployConfig]:
+    """SPIKE (explore/mfa-3stage): append a forced-aligner pooling stage.
+
+    When ``--forced-aligner`` is set, tack an ``LLM_POOLING`` stage onto the
+    end of the TTS pipeline (Talker -> Code2Wav -> ForcedAligner). The aligner
+    is a separate checkpoint, carried via the deploy stage's ``engine_extras``
+    (model/runner/hf_overrides) and honored by build_engine_args_dict's
+    per-stage model override.
+    """
+    aligner_model = cli_overrides.get("forced_aligner")
+    if not aligner_model:
+        return pipeline, deploy
+
+    from types import SimpleNamespace
+
+    from vllm_omni.utils.forced_aligner import build_forced_aligner_config
+
+    fa = build_forced_aligner_config(
+        SimpleNamespace(
+            forced_aligner=aligner_model,
+            forced_aligner_config=cli_overrides.get("forced_aligner_config"),
+            forced_aligner_gpu_memory_utilization=cli_overrides.get("forced_aligner_gpu_memory_utilization"),
+            forced_aligner_device=cli_overrides.get("forced_aligner_device"),
+        )
+    )
+    if fa is None:
+        return pipeline, deploy
+
+    new_id = len(pipeline.stages)
+    aligner_ps = StagePipelineConfig(
+        stage_id=new_id,
+        model_stage="forced_aligner",
+        execution_type=StageExecutionType.LLM_POOLING,
+        input_sources=(new_id - 1,),
+        final_output=True,
+        final_output_type="timestamps",
+        owns_tokenizer=True,
+        requires_multimodal_data=True,
+        model_arch=fa.architecture,
+        custom_process_input_func=(
+            "vllm_omni.model_executor.stage_input_processors.forced_aligner.code2wav2aligner"
+        ),
+    )
+    extended = dataclasses.replace(pipeline, stages=pipeline.stages + (aligner_ps,))
+
+    engine_extras: dict[str, Any] = {"model": fa.model, "runner": fa.runner or "pooling"}
+    if fa.architecture:
+        engine_extras["hf_overrides"] = {"architectures": [fa.architecture]}
+    if fa.trust_remote_code is not None:
+        engine_extras["trust_remote_code"] = fa.trust_remote_code
+    if fa.dtype is not None:
+        engine_extras["dtype"] = fa.dtype
+    # pooling task ("token_classify") is defaulted in extract_stage_metadata.
+    aligner_ds = StageDeployConfig(
+        stage_id=new_id,
+        devices=fa.device,
+        gpu_memory_utilization=fa.gpu_memory_utilization,
+        max_model_len=fa.max_model_len,
+        engine_extras=engine_extras,
+    )
+    deploy.stages = list(deploy.stages) + [aligner_ds]
+    logger.info("[stage_init] Injected forced-aligner stage %d (model=%s)", new_id, fa.model)
+    return extended, deploy
+
+
 def merge_pipeline_deploy(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
@@ -1213,6 +1282,9 @@ class StageConfigFactory:
                 f"{sorted(_PIPELINE_REGISTRY.keys())}"
             )
         pipeline_cfg = _PIPELINE_REGISTRY[pipeline_key]
+
+        # SPIKE (explore/mfa-3stage): optionally append a forced-aligner stage.
+        pipeline_cfg, deploy_cfg = _inject_forced_aligner_stage(pipeline_cfg, deploy_cfg, cli_overrides)
 
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 

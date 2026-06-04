@@ -402,7 +402,8 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     # PoolingParams, not SamplingParams. The orchestrator's request builder
     # already branches on the param type.
     if stage_type == "llm" and str(engine_args.get("worker_type", "")).lower() == "pooling":
-        default_pp = _to_dict(getattr(stage_config, "default_pooling_params", {}))
+        default_pp = _to_dict(getattr(stage_config, "default_pooling_params", {})) or {}
+        default_pp.setdefault("task", "token_classify")
         default_sampling_params: OmniSamplingParams = PoolingParams(**default_pp)
     elif stage_type == "llm":
         default_sampling_params = SamplingParams(**default_sp)
