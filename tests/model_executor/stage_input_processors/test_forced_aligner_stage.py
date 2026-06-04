@@ -1,11 +1,16 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
 from vllm_omni.model_executor.stage_input_processors.forced_aligner import (
+    ALIGNER_WORDS_KEY,
+    WORD_TIMESTAMPS_MS_KEY,
     _extract_text,
     _extract_waveform,
     code2wav2aligner,
+    decode_pooling_output,
 )
 
 
@@ -68,3 +73,48 @@ def test_code2wav2aligner_skips_unfinished_and_empty():
     # finished but empty waveform -> skipped
     empty = _FakeOutput({"audio": torch.zeros(0), "sr": torch.tensor(24000)})
     assert code2wav2aligner([empty], {"additional_information": {"text": ["hi"]}}) == []
+
+
+def test_decode_pooling_output_produces_word_timestamps_ms():
+    # 2 words -> 4 <timestamp> markers (id=99). classify_num=5, seg=200ms.
+    hf_config = SimpleNamespace(
+        timestamp_token_id=99,
+        timestamp_segment_time=200.0,
+        thinker_config=SimpleNamespace(classify_num=5),
+    )
+    # prompt: marker positions at indices 2,3,5,6
+    prompt_token_ids = [1, 1, 99, 99, 1, 99, 99]
+    request = SimpleNamespace(
+        prompt_token_ids=prompt_token_ids,
+        additional_information={ALIGNER_WORDS_KEY: [["hello", "world"]]},
+    )
+    logits = torch.zeros((7, 5), dtype=torch.float32)
+    logits[2, 0] = 1.0  # word0 start -> bin 0
+    logits[3, 2] = 1.0  # word0 end   -> bin 2
+    logits[5, 2] = 1.0  # word1 start -> bin 2
+    logits[6, 4] = 1.0  # word1 end   -> bin 4
+
+    payload = decode_pooling_output(logits, request, hf_config)
+
+    assert WORD_TIMESTAMPS_MS_KEY in payload
+    ms = payload[WORD_TIMESTAMPS_MS_KEY]
+    assert ms.tolist() == [[0, 400], [400, 800]]  # bins x 200ms
+
+
+def test_decode_pooling_output_handles_hf_config_without_thinker():
+    # hf_config without thinker_config falls back to itself for classify_num.
+    hf_config = SimpleNamespace(
+        timestamp_token_id=99,
+        timestamp_segment_time=100.0,
+        classify_num=4,
+    )
+    request = SimpleNamespace(
+        prompt_token_ids=[99, 99],
+        additional_information={ALIGNER_WORDS_KEY: [["hi"]]},
+    )
+    logits = torch.zeros((2, 4), dtype=torch.float32)
+    logits[0, 1] = 1.0
+    logits[1, 3] = 1.0
+
+    payload = decode_pooling_output(logits, request, hf_config)
+    assert payload[WORD_TIMESTAMPS_MS_KEY].tolist() == [[100, 300]]
