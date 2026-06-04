@@ -122,9 +122,10 @@ def _spike_extract_word_timestamps(res: Any) -> list[dict] | None:
     """
     try:
         outs = getattr(res, "outputs", None)
-        if not outs:
+        if outs is None:
             return None
-        out0 = outs[0]
+        # The aligner stage's res.outputs is a single PoolingOutput (not a list).
+        out0 = outs[0] if isinstance(outs, (list, tuple)) else outs
         payload = None
         for attr in ("data", "multimodal_output"):
             cand = getattr(out0, attr, None)
@@ -2747,23 +2748,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # SPIKE (explore/mfa-3stage): the forced-aligner stage emits a
             # pooling output carrying word_timestamps_ms. Capture it and do NOT
             # treat it as audio (it would crash _extract_audio_output).
-            try:
-                _o = getattr(res, "outputs", None)
-                _o0 = _o[0] if isinstance(_o, (list, tuple)) and _o else _o
-                logger.info(
-                    "[aligner-dbg] res=%s outputs_type=%s out0_type=%s out0_attrs=%s data_type=%s mm=%s",
-                    type(res).__name__,
-                    type(_o).__name__,
-                    type(_o0).__name__,
-                    [a for a in dir(_o0) if not a.startswith("__")][:20] if _o0 is not None else None,
-                    type(getattr(_o0, "data", None)).__name__,
-                    type(getattr(_o0, "multimodal_output", None)).__name__,
-                )
-            except Exception as _e:
-                logger.info("[aligner-dbg] introspect failed: %s", _e)
             ts = _spike_extract_word_timestamps(res)
             if ts is not None:
-                logger.info("[aligner] word timestamps (ms): %s", ts)
+                # Pair the decoded times with words re-segmented from the
+                # request text (same segmentation the aligner used, in order).
+                if any(not t["word"] for t in ts):
+                    try:
+                        from vllm_omni.utils.qwen3_force_align_processor import segment_words
+
+                        _words = segment_words(request.input, getattr(request, "language", None))
+                        for _i, _t in enumerate(ts):
+                            if not _t["word"] and _i < len(_words):
+                                _t["word"] = _words[_i]
+                    except Exception:
+                        logger.debug("[aligner] failed to attach word labels", exc_info=True)
+                logger.info("[aligner] word timestamps: %s", ts)
                 continue
             final_output = res
             if not is_moss:
