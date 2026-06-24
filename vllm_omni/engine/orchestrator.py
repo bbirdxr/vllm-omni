@@ -157,6 +157,9 @@ class StreamingInputState:
 
 
 class Orchestrator:
+    ## Orchestrator是什么 ？
+    # 它是一个跑在后台线程里面的异步调度器
+    # 住线程接受HTTP请求，把请求放到队列 然后在自己的线程里面转asyncio循环，负责派活 收活 转活
     """Runs inside a background thread's asyncio event loop."""
 
     # Cadence at which the replica-list watcher polls for disappearances.
@@ -171,9 +174,9 @@ class Orchestrator:
 
     def __init__(
         self,
-        request_async_queue: janus.AsyncQueue[EngineQueueMessage],
-        output_async_queue: janus.AsyncQueue[dict[str, Any]],
-        rpc_async_queue: janus.AsyncQueue[dict[str, Any]],
+        request_async_queue: janus.AsyncQueue[EngineQueueMessage], # 进活
+        output_async_queue: janus.AsyncQueue[dict[str, Any]], # 出活
+        rpc_async_queue: janus.AsyncQueue[dict[str, Any]], #杂：collective RPC(给所有 worker 群发命令)
         stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
@@ -189,8 +192,8 @@ class Orchestrator:
         self.output_async_queue = output_async_queue
         self.rpc_async_queue = rpc_async_queue
 
-        self.async_chunk = bool(async_chunk)
-        self.num_stages = len(stage_pools)
+        self.async_chunk = bool(async_chunk) # 流式的开关 async_chunk=True = 真流式  False = 整段算完再走。
+        self.num_stages = len(stage_pools) # stage_pool 是一个StagePool的列表，每个StagePool对应一个stage，里面有多个replica
         self.stage_pools: list[StagePool] = stage_pools
 
         # PD disaggregation state
@@ -202,7 +205,7 @@ class Orchestrator:
             self._pd_pair = pd_config.get("pd_pair")
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
-        self.request_states: dict[str, OrchestratorRequestState] = {}
+        self.request_states: dict[str, OrchestratorRequestState] = {} # 每个请求的档案
         self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
 
         self._cfg_tracker = CfgCompanionTracker()
@@ -298,16 +301,19 @@ class Orchestrator:
             # break orchestrator construction.
             logger.exception("[Orchestrator] OmniPrometheusStatLogger init failed; metrics wrap disabled")
             self._stat_logger = None
-
+    # 启动
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
         logger.info("[Orchestrator] Starting event loop")
-
+        # 启动三个任务 ： request_task output_task 和 watch_task
+        # request_task ： 从 request_async_queue 取新请求,塞进第一个 stage
         request_task = asyncio.create_task(self._request_handler(), name="orchestrator-request-handler")
+        # output_task ： 出任务
         output_task = asyncio.create_task(
             self._orchestration_output_handler(),
             name="orchestrator-stage-output-handler",
         )
+        # watch_task ： 看副本
         # The replica watcher only runs in distributed mode. It's still
         # created in both cases so ``run()`` has a uniform task graph;
         # ``_watch_replica_list`` is a no-op poll when ``self._hub`` is None.
@@ -542,7 +548,7 @@ class Orchestrator:
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
-
+    
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
         companion_id = msg.companion_id
@@ -653,7 +659,7 @@ class Orchestrator:
         )
 
     # ---- Orchestration loop ----
-
+    # _orchestration_output_handler 启动 _orchestration_loop
     async def _orchestration_output_handler(self) -> None:
         """Poll all stages, handle transfers, send final outputs to main."""
         try:
@@ -664,40 +670,41 @@ class Orchestrator:
 
     async def _orchestration_loop(self) -> None:
         """Poll stage pools and route logical outputs."""
-        while not self._shutdown_event.is_set():
-            idle = True
-            for stage_id in range(self.num_stages):
+        while not self._shutdown_event.is_set(): # 没收到关闭就一直干活
+            idle = True # 假设这一圈没活干
+            for stage_id in range(self.num_stages): # 遍历每一个 stage
                 pool = self.stage_pools[stage_id]
-                for replica_id in pool.live_replica_ids():
+                for replica_id in pool.live_replica_ids(): # 遍历每一个活着的 replica
                     if self._shutdown_event.is_set():
                         return
 
                     if pool.stage_type == "diffusion":
-                        output = pool.poll_diffusion_output(replica_id)
+                        output = pool.poll_diffusion_output(replica_id) # 扩散产出
                         if output is None:
-                            continue
+                            continue # 是None 就 continue
 
-                        pool.record_output_timestamps([output])
-                        await self._handle_processed_outputs(stage_id, replica_id, [output])
-                        idle = False
+                        pool.record_output_timestamps([output]) # 打印性能时间戳
+                        await self._handle_processed_outputs(stage_id, replica_id, [output]) # 路由出去
+                        idle = False # 不空闲
                     else:
                         try:
-                            raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
+                            raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001) # 原始产出 最多等0.001s
                             if raw_outputs is None:
                                 continue
 
-                            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
-                            for eco in raw_outputs.outputs:
-                                req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None or not req_state.streaming.enabled:
+                            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs) 
+                            for eco in raw_outputs.outputs: # 遍历所有原始输出
+                                req_state = self.request_states.get(getattr(eco, "request_id", None)) # 寻找档案也就是state
+                                if req_state is None or not req_state.streaming.enabled: # 非流式请求/已经没有档案了 直接continue
                                     continue
-                                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False)) # 是否说完了
                                 req_state.streaming.new_prompt_len_snapshot = getattr(
                                     eco,
                                     "new_prompt_len_snapshot",
                                     None,
                                 )
                                 if req_state.streaming.enabled:
+                                    # 涉及到一个清除的竞态问题
                                     await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
                             # OmniSchedulerMixin.make_stats() already throttles
                             # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
@@ -763,16 +770,16 @@ class Orchestrator:
                         idle = False
 
             if idle:
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(0.001) # 如果一整圈都没产出 谁1ms 别空烧cpu
             else:
-                await asyncio.sleep(0)
-
+                await asyncio.sleep(0) # 有产出 让出控制权，直接开抢
+    # 路由前的"分拣台"
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
         pool = self.stage_pools[stage_id]
-        for output in outputs:
+        for output in outputs: # 这批产出逐个处理
             req_state = self.request_states.get(output.request_id)
-            if req_state is None:
+            if req_state is None: # 无主产出 打日志
                 logger.warning(
                     "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
                     output.request_id,
@@ -781,12 +788,12 @@ class Orchestrator:
                 )
                 continue
 
-            if getattr(output, "error", None) is not None:
-                await self._handle_stage_error(stage_id, output)
+            if getattr(output, "error", None) is not None: # 错误产出
+                await self._handle_stage_error(stage_id, output) # 给客户端发送 ErrorMessage + 清理
                 continue
 
             stage_metrics = None
-            if output.finished:
+            if output.finished: # 产出完成了，构建 stage_metrics 性能指标
                 stage_metrics = pool.build_stage_metrics(
                     [output],
                     submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
@@ -832,7 +839,7 @@ class Orchestrator:
             self._pd_kv_params.pop(request_id, None)
             if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
                 self._running_counter.decrement()
-
+    # 会话结束 eos抢救
     async def _apply_raw_terminal_stage_finish(
         self,
         stage_id: int,
@@ -850,10 +857,11 @@ class Orchestrator:
         Only update ``finished_final_output_stage_ids`` here. Request cleanup stays
         in ``_route_output`` so downstream async-chunk stages can still deliver
         outputs after stage-0 session end.
+        原因：因为调用的是vllm服务，如果直接把最后一帧交给vllm，vllm可能看到是最后直接输出后直接删除了，所以需要早记录
         """
-        if getattr(eco, "finish_reason", None) is None:
+        if getattr(eco, "finish_reason", None) is None: # 压根没结束
             return
-        if getattr(eco, "is_segment_finished", False):
+        if getattr(eco, "is_segment_finished", False): # 句段结束，有正常路径管
             return
 
         final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
@@ -890,7 +898,7 @@ class Orchestrator:
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
-
+        # CFG 暂时先跳过
         # CFG companion: stash output so parent can bundle [parent, *companions]
         # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
@@ -900,12 +908,12 @@ class Orchestrator:
             return
 
         request_finished = False
-        if finished and self.stage_pools[stage_id].final_output:
-            req_state.finished_final_output_stage_ids.add(stage_id)
+        if finished and self.stage_pools[stage_id].final_output: # 这个是最终输出阶段且完成了
+            req_state.finished_final_output_stage_ids.add(stage_id) # 记上一笔
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-            request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
-        if self.stage_pools[stage_id].final_output:
-            await self.output_async_queue.put(
+            request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids) # 如果所有最终输出阶段都完成了，说明整个请求完成了
+        if self.stage_pools[stage_id].final_output: # 只要是终端 stage
+            await self.output_async_queue.put( # 把产出推进"出"队列,回客户端
                 OutputMessage(
                     request_id=req_id,
                     stage_id=stage_id,
@@ -916,7 +924,7 @@ class Orchestrator:
                     stage_submit_ts=submit_ts,
                 )
             )
-        elif stage_metrics is not None:
+        elif stage_metrics is not None: # 不是终端 stage,但有指标
             await self.output_async_queue.put(
                 StageMetricsMessage(
                     request_id=req_id,
@@ -926,7 +934,7 @@ class Orchestrator:
                     stage_submit_ts=submit_ts,
                 )
             )
-
+        # PD分离 暂时不用看
         if self._pd_pair is not None and finished and stage_id == self._pd_pair[0]:
             kv_params = getattr(output, "kv_transfer_params", None)
             if kv_params is not None:
@@ -934,26 +942,26 @@ class Orchestrator:
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
         if (
-            (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
-            and stage_id < req_state.final_stage_id
-            and not self.async_chunk
-            and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
+            (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished)) # 有东西往下面喂了
+            and stage_id < req_state.final_stage_id # 还没到最后一阶段
+            and not self.async_chunk # 非流
+            and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled) # 
         ):
             if (
                 finished
                 and self._cfg_tracker.has_companions(req_id)
                 and not self._cfg_tracker.all_companions_done(req_id)
-            ):
+            ): # CFG相关，暂时先不看
                 self._cfg_tracker.defer_parent(req_id, output, stage_id)
-            else:
-                await self._forward_to_next_stage(
+            else: # 转发
+                await self._forward_to_next_stage( # 把产出送到下一个stage
                     req_id,
                     stage_id,
                     output,
                     req_state,
                     src_replica_id=replica_id,
                     is_streaming_session=req_state.streaming.enabled,
-                    is_final_update=False,
+                    is_final_update=False, # 不是中止帧
                 )
                 if req_state.streaming.enabled and finished:
                     # For streaming sessions, send the terminal (resumable=False) update only on a finish
@@ -1121,16 +1129,16 @@ class Orchestrator:
         is_final_update: bool = False,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
-        next_logical = src_stage_id + 1
-        next_pool = self.stage_pools[next_logical]
-        next_client = next_pool.stage_client
-        params = req_state.sampling_params_list[next_logical]
-        source_outputs = [output]
-        next_stage_resumable = is_streaming_session and not is_final_update
-        already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
-        requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
+        next_logical = src_stage_id + 1 # 下一段
+        next_pool = self.stage_pools[next_logical] # 下一段的 stage pool
+        next_client = next_pool.stage_client # 下一段的 stage client
+        params = req_state.sampling_params_list[next_logical] # 下一段的采样参数
+        source_outputs = [output] # 要往下喂的源产出
+        next_stage_resumable = is_streaming_session and not is_final_update # 流式且非终止帧 -> 下一段是可恢复的
+        already_submitted = self._next_stage_already_submitted(src_stage_id, req_state) # 下一段是否已经提交过了
+        requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False) # 下一段是否需要多模态数据
         _t_submit_start = _time.perf_counter()
-
+        # 暂时跳过 diffusion路径
         if next_pool.stage_type == "diffusion":
             companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
             expected = len(self._cfg_tracker.get_companion_request_ids(req_id))
@@ -1227,7 +1235,7 @@ class Orchestrator:
                 tx_ms=_tx_ms,
             )
             return
-
+        # PD分离路径 暂时跳过
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
         if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
             params = self._build_pd_decode_params(req_id, params)
@@ -1275,9 +1283,9 @@ class Orchestrator:
                 tx_ms=_tx_ms,
             )
             return
-
+        # 通用路径
         if req_state.pd_prefill_multimodal_output is not None:
-            req_state.streaming.bridge_states.setdefault(
+            req_state.streaming.bridge_states.setdefault( # 把"上游产出"转成"下一段的输入"
                 "pd_prefill_multimodal_output_by_req",
                 {},
             )[req_id] = req_state.pd_prefill_multimodal_output
@@ -1297,7 +1305,7 @@ class Orchestrator:
             raise
 
         # Build and submit requests for each input
-        for next_input in next_inputs:
+        for next_input in next_inputs: # 挨个构造并提交
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             model_stage = getattr(next_client, "model_stage", None)
@@ -1327,7 +1335,7 @@ class Orchestrator:
             request_id=req_id,
             tx_ms=_tx_ms,
         )
-
+    # 提前开机
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
@@ -1346,14 +1354,14 @@ class Orchestrator:
             )
             return
 
-        for next_stage_id in range(1, req_state.final_stage_id + 1):
+        for next_stage_id in range(1, req_state.final_stage_id + 1): # 把 1..最后 全部预提交
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()
 
-            if next_pool.stage_type == "diffusion":
+            if next_pool.stage_type == "diffusion": # 如果是 diffsuion 用原prompt来占位
                 await next_pool.submit_initial(
                     request_id,
                     req_state,
@@ -1365,7 +1373,7 @@ class Orchestrator:
                         )
                     },
                 )
-            else:
+            else: # 否则用假数据去占位
                 import copy
 
                 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
