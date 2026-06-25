@@ -770,7 +770,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
+            model_output = self._model_forward( # 前向 获得一整排 [n_token, hidden_dim]
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
@@ -816,7 +816,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     assert isinstance(hidden_states, IntermediateTensors)
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
-
+                # ？？？ 为什么存在
                 if self.is_pooling_model:
                     # Return the pooling output.
                     return self._pool(

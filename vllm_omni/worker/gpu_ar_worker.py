@@ -30,7 +30,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type in ("cuda", "musa"):
-            # This env var set by Ray causes exceptions with graph building.
+            # This env var set by Ray causes exceptions with graph building. 搭环境
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
             if (
@@ -62,7 +62,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             torch.accelerator.set_device_index(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
-
+            # 搭分布式环境 + 量显存
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
@@ -90,7 +90,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
-        # Initialize workspace manager
+        # Initialize workspace manager 计算缓冲区
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
