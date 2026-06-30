@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
@@ -371,8 +372,18 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     final_output_type: str | None = getattr(stage_config, "final_output_type", None)
 
     default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
-    SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-    default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
+    # A pooling stage carries its task via default_pooling_params, set where the
+    # stage is declared.
+    default_pp = _to_dict(getattr(stage_config, "default_pooling_params", {}))
+    # A pooling stage is an LLM stage run with runner="pooling" (vLLM's
+    # is_pooling_model signal); pick params by that signal, not execution_type.
+    is_pooling = str(engine_args.get("runner", "")).lower() == "pooling"
+    if stage_type == "diffusion":
+        default_sampling_params: OmniSamplingParams = OmniDiffusionSamplingParams(**default_sp)
+    elif is_pooling:
+        default_sampling_params = PoolingParams(**default_pp)
+    else:  # generative llm: ar / generation
+        default_sampling_params = SamplingParams(**default_sp)
 
     custom_process_input_func: Callable | None = None
     _cpif_path = getattr(stage_config, "custom_process_input_func", None)

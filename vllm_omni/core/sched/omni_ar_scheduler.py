@@ -9,6 +9,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -91,8 +92,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 async_chunk=False,
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
+        # Optional per-stage pooling-output decoder hook (dotted path in
+        # model_config); applied worker-side before IPC.
+        self._pooling_output_decoder = None
+        _decoder_path = getattr(model_config, "pooling_output_decoder", None)
+        if _decoder_path:
+            self._pooling_output_decoder = resolve_obj_by_qualname(str(_decoder_path))
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+
+    def _maybe_decode_pooling_output(self, request: Any, pooler_output: Any) -> Any:
+        """Apply the stage's pooling-output decoder hook to the pooler tensor
+        before IPC, or pass it through unchanged when none is configured."""
+        # Fast path: no decoder configured -> pass through.
+        if self._pooling_output_decoder is None:
+            return pooler_output
+        if pooler_output is None or getattr(request, "pooling_params", None) is None:
+            return pooler_output
+        import torch as _torch
+
+        if not isinstance(pooler_output, _torch.Tensor):
+            return pooler_output
+        try:
+            return self._pooling_output_decoder(
+                pooler_output,
+                request,
+                self.vllm_config.model_config.hf_config,
+            )
+        except Exception:
+            logger.exception("[pooling] decoder hook failed; dropping pooler output")
+            return None
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -465,6 +494,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            pooling_output_payload = self._maybe_decode_pooling_output(request, pooler_output)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
@@ -474,7 +504,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooler_output,
+                        pooling_output=pooling_output_payload,
                         multimodal_output=mm_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),

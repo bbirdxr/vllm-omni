@@ -157,6 +157,8 @@ class OmniEngineArgs(EngineArgs):
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
+    # Dotted path of a per-stage pooling-output decoder applied worker-side.
+    pooling_output_decoder: str | None = None
     task_type: str | None = None
     worker_cls: str = None  # type: ignore[assignment]  # Upstream default is "auto"; omni resolves
     # in __post_init__ based on worker_type (ar/generation), so None is safe here.
@@ -333,6 +335,7 @@ class OmniEngineArgs(EngineArgs):
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,
+            pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,

@@ -1102,7 +1102,7 @@ async def omni_init_app_state(
         state.openai_serving_models,
         request_logger=request_logger,
         model_name=model_name,
-        forced_aligner_config=build_forced_aligner_config(args),
+        forced_aligner_enabled=build_forced_aligner_config(args) is not None,
     )
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first

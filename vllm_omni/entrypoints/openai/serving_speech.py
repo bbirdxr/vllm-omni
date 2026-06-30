@@ -414,7 +414,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def __init__(self, *args, **kwargs):
         self.model_name = kwargs.pop("model_name", None)
-        self.forced_aligner_config: Any | None = kwargs.pop("forced_aligner_config", None)
+        # True when the server was launched with --forced-aligner (a pooling
+        # aligner stage is appended to the pipeline). Gates word_timestamps.
+        self.forced_aligner_enabled: bool = bool(kwargs.pop("forced_aligner_enabled", False))
         super().__init__(*args, **kwargs)
         self._init_speaker_storage()
 
@@ -2593,6 +2595,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         raw_request: Request | None = None,
         request_start_s: float | None = None,
         include_sample_rate: bool = False,
+        collect: dict | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -2621,6 +2624,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             async for res in generator:
                 audio_output, audio_key = self._extract_audio_output(res)
                 if audio_key is None:
+                    # Non-audio output (e.g. the forced-aligner stage's pooling
+                    # result). Stash the latest so streaming callers can surface
+                    # word timestamps once the audio has finished flowing.
+                    if collect is not None:
+                        collect["aligner_res"] = res
                     continue
 
                 sr_raw = audio_output.get("sr")
@@ -3559,26 +3567,40 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     sampling_params_list[0].extra_args = {}
                 sampling_params_list[0].extra_args["qwen3_tts_request_seed"] = request.seed
 
+        # When word_timestamps is requested, also ask for the aligner stage's
+        # output so the orchestrator drives the request through the forced-aligner
+        # stage (final_stage_id extends to it). Harmless if no aligner stage exists.
+        output_modalities = ["audio"]
+        if getattr(request, "word_timestamps", False):
+            from vllm_omni.model_executor.stage_input_processors.forced_aligner import TIMESTAMPS_MODALITY
+
+            output_modalities.append(TIMESTAMPS_MODALITY)
+
         generator = self.engine_client.generate(
             prompt=prompt,
             request_id=request_id,
             sampling_params_list=sampling_params_list,
-            output_modalities=["audio"],
+            output_modalities=output_modalities,
         )
         self._track_ref_audio_artifact_warmup(request_id, qwen3_ref_audio_warmup_artifact_key)
         return request_id, generator, tts_params
 
-    async def _generate_pcm_chunks(self, generator, request_id: str, *, include_sample_rate: bool = False):
+    async def _generate_pcm_chunks(
+        self, generator, request_id: str, *, include_sample_rate: bool = False, collect: dict | None = None
+    ):
         """Yield raw PCM byte chunks from the engine generator.
 
         Delegates to ``_generate_audio_chunks`` with ``response_format="pcm"``.
         Used by the WebSocket streaming handler and ``_iter_pcm_audio_bytes``.
+        ``collect`` (when given) receives the forced-aligner stage's pooling
+        output under ``"aligner_res"`` for downstream word-timestamp extraction.
         """
         async for chunk in self._generate_audio_chunks(
             generator,
             request_id,
             response_format="pcm",
             include_sample_rate=include_sample_rate,
+            collect=collect,
         ):
             yield chunk
 
@@ -3596,6 +3618,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request: OpenAICreateSpeechRequest,
         base64_encode: bool = False,
         request_id: str | None = None,
+        collect: dict | None = None,
     ) -> tuple[bytes | str, str]:
         request_id, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
         artifact_ready = False
@@ -3610,8 +3633,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             moss_sample_rate: int | None = None
 
             final_output: OmniRequestOutput | None = None
+            audio_res: OmniRequestOutput | None = None
+            aligner_res: OmniRequestOutput | None = None
             async for res in generator:
                 final_output = res
+                # The generator yields both the audio output (Code2Wav) and, with
+                # a forced-aligner stage, a timestamps output. Keep the audio res
+                # for the WAV and the aligner res for word timestamps.
+                try:
+                    _, _k = self._extract_audio_output(res)
+                except Exception:
+                    aligner_res = res
+                else:
+                    if _k is not None:
+                        audio_res = res
+                    else:
+                        aligner_res = res
                 if not is_moss:
                     continue
                 try:
@@ -3633,9 +3670,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if final_output is None:
                 raise ValueError("No output generated from the model.")
 
-            audio_output, audio_key = self._extract_audio_output(final_output)
+            # Extract audio from the audio-bearing res (not necessarily the last
+            # yielded one, which may be the aligner's timestamps output).
+            audio_source = audio_res if audio_res is not None else final_output
+            audio_output, audio_key = self._extract_audio_output(audio_source)
             if audio_key is None:
                 raise ValueError("TTS model did not produce audio output.")
+
+            # Surface forced-aligner word timestamps to the caller (set as a
+            # response header) when requested and an aligner stage produced them.
+            if collect is not None and getattr(request, "word_timestamps", False):
+                from vllm_omni.utils.forced_aligner import extract_word_timestamps
+
+                ts = (
+                    extract_word_timestamps(aligner_res, request.input, getattr(request, "language", None))
+                    if aligner_res is not None
+                    else None
+                )
+                if ts is not None:
+                    collect["word_timestamps"] = ts
 
             audio_tensor = audio_output[audio_key]
             sr_raw = audio_output.get("sr", 24000)
@@ -3941,7 +3994,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     media_type="text/event-stream",
                 )
 
-            audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
+            collect: dict = {}
+            audio_bytes, media_type = await self._generate_audio_bytes(
+                request, request_id=request_id, collect=collect
+            )
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.info(
                 "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
@@ -3949,7 +4005,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
                 len(audio_bytes) if isinstance(audio_bytes, (bytes, bytearray)) else len(str(audio_bytes)),
             )
-            return Response(content=audio_bytes, media_type=media_type)
+            headers = {}
+            if collect.get("word_timestamps") is not None:
+                headers["X-Word-Timestamps"] = json.dumps(collect["word_timestamps"], ensure_ascii=False)
+            return Response(content=audio_bytes, media_type=media_type, headers=headers)
 
         except asyncio.CancelledError:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
