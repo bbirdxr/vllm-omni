@@ -158,6 +158,7 @@ def inject_forced_aligner_stage(
         engine_extras["dtype"] = fa.dtype
     aligner_ds = StageDeployConfig(
         stage_id=new_id,
+        devices=cli_overrides.get("forced_aligner_device"),
         gpu_memory_utilization=fa.gpu_memory_utilization,
         max_model_len=fa.max_model_len,
         engine_extras=engine_extras,

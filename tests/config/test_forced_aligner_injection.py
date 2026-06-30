@@ -1,4 +1,5 @@
 import pytest
+
 import vllm_omni.config.pipeline_registry  # noqa: F401  (populate registry)
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES as _PIPELINE_REGISTRY
 from vllm_omni.config.stage_config import (
