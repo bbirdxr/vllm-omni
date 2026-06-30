@@ -170,6 +170,12 @@ class StageConfigFactory:
         if cli_async_chunk is not None:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
 
+        # append the forced-aligner stage when --forced-aligner is set
+        if cli_overrides.get("forced_aligner"):
+            from vllm_omni.utils.forced_aligner import inject_forced_aligner_stage
+
+            pipeline_cfg, deploy_cfg = inject_forced_aligner_stage(pipeline_cfg, deploy_cfg, cli_overrides)
+
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
         explicit_overrides = {k: v for k, v in cli_overrides.items() if v is not None}

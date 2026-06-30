@@ -1156,6 +1156,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            # A pooling stage skips the omni hidden-state prefix cache + mm
+            # extraction (those assume an AR output [n_tok, hidden]); the pooler
+            # produces [n_tok, classify_num]. Go straight to _pool().
+            if self.is_pooling_model:
+                if not self.broadcast_pp_output and not get_pp_group().is_last_rank:
+                    assert isinstance(hidden_states, IntermediateTensors)
+                    hidden_states.kv_connector_output = kv_connector_output
+                    self.kv_connector_output = kv_connector_output
+                    return hidden_states
+                return self._pool(
+                    hidden_states,
+                    num_scheduled_tokens,
+                    num_scheduled_tokens_np,
+                    kv_connector_output,
+                )
+
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             hidden_states_cpu = None
 
